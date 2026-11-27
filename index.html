@@ -19,6 +19,11 @@ var FETCH_TIMEOUT_MS = 8000;
 var CACHE_S = 600;           // answers are reused for 10 minutes (the page reloads per request)
 var LB_REGIONS = ["Europe", "NAmerica", "SAmerica", "Asia", "Oceania"];
 var LB_SHORT = { Europe: "EU", NAmerica: "NA", SAmerica: "SA", Asia: "ASIA", Oceania: "OCE" };
+var TOP_OVERALL = 50;        // top N of each regional leaderboard count as pros
+var TOP_HERO = 10;           // top N of each hero leaderboard count as that hero's specialists
+var TOP_BUILDS = 12;         // builds listed per section
+var USED_DAYS = 21;          // "used by pros" looks at ranked matches this recent
+var POPULAR_DAYS = 14;       // "popular in Eternus" looks at ranked matches this recent
 
 // ---------- helpers ----------
 
@@ -95,52 +100,94 @@ var commands = {
         });
     },
 
-    // Top players on this hero's leaderboard in each region, and their builds for it.
-    specialists: function (q) {
-        var hero = Number(q.hero), perRegion = Math.min(Number(q.top) || 10, 25);
-        return cached("spec_" + hero + "_" + perRegion, function () {
-            return Promise.all(LB_REGIONS.map(function (r) {
-                return getJson("/v1/leaderboard/" + r + "/" + hero).catch(function () { return { entries: [] }; });
-            })).then(function (boards) {
-                var people = [], seen = {};
-                boards.forEach(function (board, i) {
-                    (board.entries || []).slice(0, perRegion).forEach(function (e) {
+    // Everything PROS shows for one hero, in one answer:
+    //   used:        builds the tracked pros actually picked in ranked matches (last USED_DAYS)
+    //   popular:     builds most used in Eternus-average ranked lobbies (last POPULAR_DAYS)
+    //   specialists: the hero's top players per region and their own published builds
+    // Tracked pros = top TOP_OVERALL of each regional leaderboard + top TOP_HERO of each hero leaderboard.
+    hero: function (q) {
+        var hero = Number(q.hero);
+        if (!hero) return Promise.reject(new Error("no hero"));
+        return cached("hero_" + hero, function () {
+            var now = Math.floor(Date.now() / 1000);
+            var boards = LB_REGIONS.map(function (r) { return "/v1/leaderboard/" + r; })
+                .concat(LB_REGIONS.map(function (r) { return "/v1/leaderboard/" + r + "/" + hero; }));
+            return Promise.all(boards.map(function (path) {
+                return getJson(path).catch(function () { return { entries: [] }; });
+            })).then(function (res) {
+                // accountId -> { region, name, place (overall), heroPlace }. Ambiguous names are skipped.
+                var lb = {};
+                function take(board, regionIndex, top, key) {
+                    (board.entries || []).slice(0, top).forEach(function (e) {
                         var ids = e.possible_account_ids || [];
-                        if (ids.length !== 1 || seen[ids[0]]) return;      // ambiguous names are skipped
-                        seen[ids[0]] = true;
-                        people.push({ id: ids[0], region: LB_SHORT[LB_REGIONS[i]], place: e.rank, lbName: e.account_name });
+                        if (ids.length !== 1) return;
+                        var x = lb[ids[0]] || (lb[ids[0]] = { region: LB_SHORT[LB_REGIONS[regionIndex]], name: e.account_name });
+                        x[key] = e.rank;
                     });
-                });
+                }
+                res.slice(0, 5).forEach(function (b, i) { take(b, i, TOP_OVERALL, "place"); });
+                res.slice(5).forEach(function (b, i) { take(b, i, TOP_HERO, "heroPlace"); });
+                var pros = Object.keys(lb).map(Number);
+                var specialists = pros.filter(function (id) { return lb[id].heroPlace; })
+                                      .sort(function (a, b) { return lb[a].heroPlace - lb[b].heroPlace; });
+                var stats = "/v1/analytics/hero-build-stats?hero_ids=" + hero + "&match_mode=ranked";
+
                 return Promise.all([
-                    pool(people, 8, function (p) {
-                        return getJson("/v1/builds?author_id=" + p.id + "&hero_id=" + hero + "&only_latest=true&sort_by=updated_at&limit=5");
-                    }),
-                    profiles(people.map(function (p) { return p.id; }))
-                ]).then(function (res) {
-                    var buildLists = res[0], prof = res[1];
-                    return {
-                        hero: hero,
-                        players: people.map(function (p, i) {
-                            var pr = prof[p.id];
+                    pros.length ? getJson(stats + "&account_ids=" + pros.join(",") + "&min_unix_timestamp=" + (now - USED_DAYS * 86400)).catch(function () { return []; }) : [],
+                    getJson(stats + "&min_average_badge=111&min_matches=5&min_unix_timestamp=" + (now - POPULAR_DAYS * 86400)).catch(function () { return []; }),
+                    pool(specialists, 8, function (id) {
+                        return getJson("/v1/builds?author_id=" + id + "&hero_id=" + hero + "&only_latest=true&sort_by=updated_at&limit=3");
+                    })
+                ]).then(function (r) {
+                    function top(list) {
+                        return (list || []).filter(function (x) { return x.hero_build_id; })
+                            .sort(function (a, b) { return (b.players - a.players) || (b.matches - a.matches); })
+                            .slice(0, TOP_BUILDS)
+                            .map(function (x) { return { id: x.hero_build_id, players: x.players, matches: x.matches }; });
+                    }
+                    var used = top(r[0]), popular = top(r[1]);
+                    var builds = {};
+                    specialists.forEach(function (id, i) { (r[2][i] || []).forEach(function (b) { b = slimBuild(b); builds[b.id] = b; }); });
+                    var need = used.concat(popular).map(function (x) { return x.id; }).filter(function (id, i, all) { return !builds[id] && all.indexOf(id) === i; });
+
+                    return pool(need, 8, function (id) {
+                        return getJson("/v1/builds?build_id=" + id + "&only_latest=true&limit=1");
+                    }).then(function (lists) {
+                        lists.forEach(function (l) { if (l && l[0]) { var b = slimBuild(l[0]); builds[b.id] = b; } });
+                        var authors = Object.keys(builds).map(function (id) { return builds[id].a; }).concat(specialists)
+                            .filter(function (id, i, all) { return all.indexOf(id) === i; });
+                        return profiles(authors).then(function (prof) {
+                            var people = {};
+                            authors.forEach(function (id) {
+                                var p = prof[id], l = lb[id] || {};
+                                people[id] = { name: p.name || l.name || ("Player " + id), avatar: p.avatar, badge: p.badge,
+                                               region: l.region || null, place: l.place || null, heroPlace: l.heroPlace || null };
+                            });
+                            var known = function (x) { return builds[x.id]; };
                             return {
-                                id: p.id, name: pr.name || p.lbName || ("Player " + p.id), avatar: pr.avatar,
-                                badge: pr.badge, region: p.region, place: p.place,
-                                builds: (buildLists[i] || []).map(slimBuild)
+                                hero: hero, tracked: pros.length, usedDays: USED_DAYS, popularDays: POPULAR_DAYS,
+                                used: used.filter(known), popular: popular.filter(known),
+                                specialists: specialists.map(function (id) {
+                                    return { id: id, builds: Object.keys(builds).map(function (k) { return builds[k]; })
+                                                                .filter(function (b) { return b.a === id && b.h === hero; })
+                                                                .sort(function (a, b) { return b.u - a.u; }) };
+                                }),
+                                builds: builds, people: people
                             };
-                        })
-                    };
+                        });
+                    });
                 });
             });
         });
     },
 
-    // Latest builds, any hero, from the players the user follows.
+    // Latest builds for this hero from the players the user follows.
     following: function (q) {
-        var ids = (q.ids || []).map(Number).filter(Boolean).slice(0, 40);
-        return cached("follow_" + ids.slice().sort().join(","), function () {
+        var ids = (q.ids || []).map(Number).filter(Boolean).slice(0, 40), hero = Number(q.hero);
+        return cached("follow_" + hero + "_" + ids.slice().sort().join(","), function () {
             return Promise.all([
                 pool(ids, 8, function (id) {
-                    return getJson("/v1/builds?author_id=" + id + "&only_latest=true&sort_by=updated_at&limit=8");
+                    return getJson("/v1/builds?author_id=" + id + "&hero_id=" + hero + "&only_latest=true&sort_by=updated_at&limit=5");
                 }),
                 profiles(ids)
             ]).then(function (res) {
