@@ -1,0 +1,41 @@
+# Rebuilds the relay site every hour: index.html + core.js + fresh data/ files.
+# Needs Settings > Pages > Source = "GitHub Actions".
+name: Build data
+
+on:
+  schedule:
+    - cron: "17 * * * *"      # hourly, off the busy :00 mark
+  workflow_dispatch:          # "Run workflow" button
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build data files
+        run: node build_data.js _site
+      - name: Add the relay page
+        run: cp index.html core.js _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4
