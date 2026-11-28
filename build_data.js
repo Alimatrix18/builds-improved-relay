@@ -22,7 +22,7 @@ const BUILD_REFETCH_S = 20 * 3600;  // cached builds are re-read once a day (the
 const MISSING_RETRY_S = 3 * 86400;  // a build the API didn't return is asked again after this
 const AUTHORS_REFETCH_S = 20 * 3600;
 const MAX_FETCHES = 8000;           // build and author requests per run; the rest wait for the next run
-const LAKE_TIMEOUT_MS = 30 * 60 * 1000;
+const LAKE_TIMEOUT_MS = 40 * 60 * 1000;
 
 function write(name, value) { fs.writeFileSync(path.join(OUT, "data", name + ".json"), JSON.stringify(value)); }
 function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { return fallback; } }

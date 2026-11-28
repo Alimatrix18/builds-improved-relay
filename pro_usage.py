@@ -41,8 +41,9 @@ def manifest():
         return json.load(r)
 
 
-def match_player_urls(m, since):
-    """Parquet files of match_player's current generation that can hold matches started since `since`."""
+def match_player_files(m, since):
+    """[(key, url)] of match_player's current generation that can hold matches started since `since`,
+    and the generation. Files are immutable and uniquely named, so a key read once never needs reading again."""
     t = m["tables"]["match_player"]
     gen, base = t.get("generation", 0), m["public_url"].rstrip("/")
     out = []
@@ -54,12 +55,15 @@ def match_player_urls(m, since):
                 continue
         elif f.get("hi") is not None and f["hi"] < since:  # deltas: rows created up to hi
             continue
-        out.append(base + "/" + f["key"] if base.startswith("http") else os.path.join(base, f["key"]))
-    return out
+        out.append((f["key"], base + "/" + f["key"] if base.startswith("http") else os.path.join(base, f["key"])))
+    return out, gen
 
 
 def connect():
-    con = duckdb.connect()
+    try:
+        con = duckdb.connect(config={"custom_user_agent": USER_AGENT})   # data file requests say who they are
+    except duckdb.Error:
+        con = duckdb.connect()
     try:
         con.execute("SET TimeZone = 'UTC'")                 # ClickHouse DateTime values are UTC
     except duckdb.Error:
@@ -67,62 +71,99 @@ def connect():
     return con
 
 
+FULL_SCAN_DAYS = 7     # a full rescan this often picks up the history of players new to the leaderboards
+
+
 def usage(tracked_path, out_path, matches_path, days, half_life):
+    """Incremental: the (match, player) rows already read are kept in <cache>/lake/ with the list of
+    files they came from; a run reads only the files added since, unless a full rescan is due (weekly,
+    a new export generation, or no saved rows)."""
     tracked = sorted({int(x) for x in json.load(open(tracked_path))})
     now = int(time.time())
     since = now - days * 86400
-
+    lake_dir = os.path.join(os.path.dirname(os.path.abspath(matches_path)), "lake")
+    os.makedirs(lake_dir, exist_ok=True)
+    store_path, state_path = os.path.join(lake_dir, "rows.parquet"), os.path.join(lake_dir, "state.json")
+    state = json.load(open(state_path)) if os.path.exists(state_path) else {}
     con = connect()
+
+    # the file list, so only files that can hold the window's matches are read; only if the file
+    # list itself is refused, the DuckLake catalog (a full scan, slower)
     try:
-        # the file list, so only files that can hold the window's matches are read
-        urls = match_player_urls(manifest(), since)
-        if not urls:
-            raise SystemExit("no match_player files for the window")
-        if urls[0].startswith("http"):
-            con.execute("INSTALL httpfs; LOAD httpfs;")
-            con.execute(f"SET http_user_agent = '{USER_AGENT}'")
-        con.execute(f"CREATE VIEW mp AS SELECT * FROM read_parquet({urls!r}, union_by_name = true)")
-        source = f"{len(urls)} files"
-    except Exception as e:                                  # the file list was refused: the DuckLake catalog
+        listing, gen = match_player_files(manifest(), since)
+    except Exception as e:
         if os.environ.get("BI_MANIFEST"):
             raise
+        listing, gen = None, None
         print(f"manifest unavailable ({e}); reading through the DuckLake catalog instead", flush=True)
+
+    full = (listing is None or not os.path.exists(store_path) or state.get("generation") != gen
+            or now - state.get("full_at", 0) > FULL_SCAN_DAYS * 86400)
+    watch = sorted(set(tracked) if full else set(tracked) | set(state.get("watch", [])))
+    if listing is not None:
+        if not listing:
+            raise SystemExit("no match_player files for the window")
+        done = set() if full else set(state.get("keys", []))
+        todo = [(k, u) for k, u in listing if k not in done]
+        print(f"{'full scan' if full else 'incremental'}: reading {len(todo)} of {len(listing)} match_player files", flush=True)
+        if todo and todo[0][1].startswith("http"):
+            con.execute("INSTALL httpfs; LOAD httpfs;")
+        urls = [u for _, u in todo]
+        source = f"{len(todo)} new files" if not full else f"{len(todo)} files (full scan)"
+    else:
         con.execute("INSTALL httpfs; LOAD httpfs; INSTALL ducklake; LOAD ducklake;")
-        try:
-            con.execute(f"SET http_user_agent = '{USER_AGENT}'")
-        except duckdb.Error:
-            pass
         con.execute(f"ATTACH 'ducklake:{CATALOG_URL}' AS lake (READ_ONLY)")
-        con.execute("CREATE VIEW mp AS SELECT * FROM lake.match_player")
-        source = "the DuckLake catalog"
-    con.execute("CREATE TABLE tracked(id UBIGINT)")
-    con.executemany("INSERT INTO tracked VALUES (?)", [(i,) for i in tracked])
+        urls, source = None, "the DuckLake catalog (full scan)"
 
-    # Column types differ by export (Enum as text or number, DateTime as timestamp or seconds).
-    types = {r[0]: r[1].upper() for r in con.execute("DESCRIBE mp").fetchall()}
-    st = "epoch(start_time)" if ("TIMESTAMP" in types.get("start_time", "") or "DATE" in types.get("start_time", "")) \
-        else "CAST(start_time AS BIGINT)"
-    mm = types.get("match_mode", "")
-    ranked = "CAST(match_mode AS VARCHAR) = 'Ranked'" if ("VARCHAR" in mm or "ENUM" in mm) else "CAST(match_mode AS INTEGER) = 4"
-    items = '"items.item_id"' if "items.item_id" in types else "CAST([] AS UINTEGER[])"
+    con.execute("CREATE TABLE watch(id UBIGINT)")
+    con.executemany("INSERT INTO watch VALUES (?)", [(i,) for i in watch])
+    con.execute("CREATE TABLE n (match_id UBIGINT, account_id UBIGINT, hero_id UBIGINT, build_id UBIGINT, started BIGINT, items UBIGINT[])")
+    t0 = time.time()
+    if urls is None or urls:
+        if urls is None:
+            con.execute("CREATE VIEW mp AS SELECT * FROM lake.match_player")
+        else:
+            con.execute(f"CREATE VIEW mp AS SELECT * FROM read_parquet({urls!r}, union_by_name = true)")
+        # Column types differ by export (Enum as text or number, DateTime as timestamp or seconds).
+        types = {r[0]: r[1].upper() for r in con.execute("DESCRIBE mp").fetchall()}
+        st = "epoch(start_time)" if ("TIMESTAMP" in types.get("start_time", "") or "DATE" in types.get("start_time", "")) \
+            else "CAST(start_time AS BIGINT)"
+        mm = types.get("match_mode", "")
+        ranked = "CAST(match_mode AS VARCHAR) = 'Ranked'" if ("VARCHAR" in mm or "ENUM" in mm) else "CAST(match_mode AS INTEGER) = 4"
+        items = 'CAST("items.item_id" AS UBIGINT[])' if "items.item_id" in types else "CAST([] AS UBIGINT[])"
+        print("scanning ranked games of tracked players…", flush=True)
+        # One row per (match, player): the export can hold a match twice, one copy without its build.
+        con.execute(f"""
+            INSERT INTO n
+            SELECT match_id, account_id, any_value(hero_id), max(hero_build_id), max({st}), arg_max({items}, len({items}))
+            FROM mp
+            WHERE {st} >= {since} AND {ranked} AND account_id IN (SELECT id FROM watch)
+            GROUP BY match_id, account_id
+            HAVING max(hero_build_id) > 0
+        """)
+    print(f"scan done in {round(time.time() - t0)}s: {con.execute('SELECT count(*) FROM n').fetchone()[0]} new (match, player) rows", flush=True)
 
-    # One row per (match, player): the export can hold a match twice, one copy without its build.
+    # saved rows + new rows, one per (match, player), inside the window
+    old = f"SELECT * FROM read_parquet('{store_path}') WHERE started >= {since}" if not full else "SELECT * FROM n WHERE false"
     con.execute(f"""
         CREATE TABLE m AS
-        SELECT match_id, account_id, any_value(hero_id) AS hero_id, max(hero_build_id) AS build_id,
-               max({st}) AS started, arg_max({items}, len({items})) AS items
-        FROM mp
-        WHERE {st} >= {since} AND {ranked}
-          AND account_id IN (SELECT id FROM tracked)
-        GROUP BY match_id, account_id
-        HAVING max(hero_build_id) > 0
+        SELECT * FROM ({old} UNION ALL SELECT * FROM n)
+        QUALIFY row_number() OVER (PARTITION BY match_id, account_id ORDER BY len(items) DESC) = 1
     """)
+    con.execute(f"COPY m TO '{store_path}' (FORMAT parquet)")
+    keys = [k for k, _ in listing] if listing is not None else []
+    json.dump({"generation": gen, "keys": keys, "watch": watch,
+               "full_at": now if full else state.get("full_at", now)}, open(state_path, "w"))
+
+    con.execute("CREATE TABLE tracked(id UBIGINT)")
+    con.executemany("INSERT INTO tracked VALUES (?)", [(i,) for i in tracked])
+    con.execute("CREATE TABLE t AS SELECT * FROM m WHERE account_id IN (SELECT id FROM tracked)")
     rows = con.execute(f"""
         SELECT hero_id, account_id, build_id, count(*) AS games, max(started) AS last,
                round(100 * sum(pow(0.5, ({now} - started) / ({half_life} * 86400.0)))) AS weighted
-        FROM m GROUP BY ALL
+        FROM t GROUP BY ALL
     """).fetchall()
-    con.execute(f"COPY (SELECT account_id, build_id, items FROM m) TO '{matches_path}' (FORMAT parquet)")
+    con.execute(f"COPY (SELECT account_id, build_id, items FROM t) TO '{matches_path}' (FORMAT parquet)")
 
     json.dump({"generatedAt": now, "days": days, "halfLife": half_life,
                "rows": [[int(h), int(a), int(b), int(g), int(t), int(w)] for h, a, b, g, t, w in rows]},
