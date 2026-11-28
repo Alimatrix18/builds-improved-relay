@@ -21,7 +21,48 @@ var CACHE_S = 600;           // live answers are reused for 10 minutes (the page
 // no file at all does the page build a (much thinner) answer live.
 var core = window.BI_CORE;
 
-function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} }
+var HERO_CACHE_MAX = 8;       // hero answers kept in this page's storage (each can be a few hundred KB)
+var HERO_PREFIX = "bi_cache_hero3_";
+
+// Cached hero answers, oldest first: [{ key, at }]. Their times are kept in a small index, so
+// finding the oldest doesn't parse every (large) cached answer.
+var INDEX_KEY = "bi_cache_index";
+function heroIndex() { try { return JSON.parse(localStorage.getItem(INDEX_KEY) || "{}") || {}; } catch (e) { return {}; } }
+function saveIndex(idx) { try { localStorage.setItem(INDEX_KEY, JSON.stringify(idx)); } catch (e) {} }
+function heroEntries() {
+    var idx = heroIndex(), out = [];
+    try {
+        for (var i = 0; i < localStorage.length; i++) {
+            var k = localStorage.key(i);
+            if (k && k.indexOf(HERO_PREFIX) === 0) out.push({ key: k, at: idx[k] || 0 });
+        }
+    } catch (e) {}
+    return out.sort(function (x, y) { return x.at - y.at; });
+}
+function dropHero(key) {
+    try { localStorage.removeItem(key); } catch (e) { return false; }
+    var idx = heroIndex(); delete idx[key]; saveIndex(idx);
+    return true;
+}
+
+// Writes to this page's storage. When it is full, cached hero answers (re-fetchable) make room,
+// oldest first, so saved builds are never lost to them. Returns whether the write succeeded.
+function store(key, value) {
+    var text = JSON.stringify(value);
+    for (;;) {
+        try { localStorage.setItem(key, text); break; }
+        catch (e) {
+            var old = heroEntries().filter(function (x) { return x.key !== key; });
+            if (!old.length || !dropHero(old[0].key)) return false;
+        }
+    }
+    if (key.indexOf(HERO_PREFIX) === 0) {
+        var idx = heroIndex(); idx[key] = (value && value.at) || nowS(); saveIndex(idx);
+        var all = heroEntries();
+        for (var n = 0; n < all.length - HERO_CACHE_MAX; n++) dropHero(all[n].key);
+    }
+    return true;
+}
 function load(key) { try { return JSON.parse(localStorage.getItem(key) || "null"); } catch (e) { return null; } }
 function nowS() { return Math.floor(Date.now() / 1000); }
 
@@ -77,8 +118,7 @@ var commands = {
         if (!b || !b.id) return Promise.reject(new Error("no build"));
         var list = (load("bi_saved") || []).filter(function (x) { return x.id !== b.id; });
         list.unshift(b);
-        store("bi_saved", list.slice(0, 200));
-        return Promise.resolve(true);
+        return store("bi_saved", list.slice(0, 200)) ? Promise.resolve(true) : Promise.reject(new Error("storage full"));
     },
     saved_remove: function (q) {
         store("bi_saved", (load("bi_saved") || []).filter(function (x) { return x.id !== Number(q.id); }));

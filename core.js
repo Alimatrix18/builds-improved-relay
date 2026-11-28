@@ -3,17 +3,25 @@
 //
 // What PROS shows for a hero: builds top players stand behind. Trust, not performance: who wrote a
 // build, which top players ran it, how recently and how much, and whether they actually followed it.
-// The mod filters by region (ALL / NA / EU / ...) and player group (top 1000, top 100, the hero's top
-// 50, saved) and sorts (best, last played, most played, newest) without asking again.
+// The mod picks the tab (top ranked, top 100, Night Shift, saved) and sort (best, most played,
+// newest) itself, without asking again.
 //
 // Hero answer (v3):
 //   { v: 3, hero, generatedAt, patchAt, days, halfLife, source,
 //     people: { accountId: { n: name, av: avatar, b: rank badge (tier*10+subrank), r: region,
 //                            p: leaderboard place (0 = not top 1000), m: this hero's leaderboard place (0 = none),
 //                            ns: 1 for Night Shift regulars } },
-//     uses:   [[accountId, buildId, games, lastPlayed, weightedGames x100, built % (-1 unknown)], ...]
+//     uses:   [[accountId, buildId, games, lastPlayed, weightedGames x100, built % (-1 unknown),
+//               off-build items per game x10 (-1 unknown), [[itemId, % of games], ...] most bought off-build,
+//               [[itemId, %], ...] core build items they rarely buy (% of the games that reached its tier),
+//               [[itemId, instead itemId, %], ...] what they buy in a skipped item's place,
+//               [[itemId, % of games, in build 0/1], ...] the late items (tier 3+) they finish most]], ...]
+//             Only each player's main build (most games) is kept: the mod counts no other.
 //             source "players": one row per player and build in ranked games; weighted: recent games count more
-//     nsUses: [[accountId, buildId, games, lastPlayed], ...]   the builds Night Shift players loaded in
+//     heroGames:   { accountId: all their ranked games on the hero, with or without a build }  (USAGE)
+//     nsHeroGames: { accountId: all their Night Shift games on the hero }
+//     itemNames:   { itemId: name } for the off-build, skipped, swapped and finished items
+//     nsUses: [[accountId, buildId, games, lastPlayed, weightedGames x100 (half-life 28 days)], ...]   the builds Night Shift players loaded in
 //             Night Shift matches (match ids from dlns-stats.co.uk)
 //     groups: [[buildId, region, group, players, games], ...]    source "groups" (no per-player data):
 //                                                                group 1 = top 100, 2 = top 1000, 3 = hero top 50
@@ -31,14 +39,14 @@ var C = {
     LB_SHORT: { Europe: "EU", NAmerica: "NA", SAmerica: "SA", Asia: "ASIA", Oceania: "OCE" },
     TOP: 1000,              // leaderboard places tracked per region
     TOP_SMALL: 100,         // the "TOP 100" group
-    TOP_HERO: 50,           // hero leaderboard places that count as the hero's mains ("MAIN")
+    TOP_HERO: 50,           // hero leaderboard places that count as the hero's mains ("MH", Main Hero)
     DAYS: 45,               // ranked games this recent...
     HALF_LIFE_DAYS: 7,      // ...a game this old counts half
     LIVE_DAYS: 14,          // the live fallback's window
     AUTHORED_DAYS: 90,      // builds written by tracked players, edited this recently
     MAX_AUTHORED: 100,      // per hero, best-placed authors first
     MAX_BUILDS: 120,        // builds kept per hero (most played first)...
-    MAX_BUILDS_REGION: 15,  // ...plus each region's most played, so region filters are never empty
+    MAX_BUILDS_REGION: 15,  // ...plus each region's most played (live per-group answers only)
     MAX_MAINS: 250,         // per hero: the builds tracked players use most (their "main" build), most shared first
     MAX_CANDIDATES: 4,      // a leaderboard name matching more Steam accounts than this is skipped
     ID_CHUNK: 300,          // account ids per analytics request
@@ -83,15 +91,16 @@ function now() { return Math.floor(Date.now() / 1000); }
 
 // ---------- shapes ----------
 
-// A build as the mod needs it. c: categories [{ n: name, d: description, o: optional, m: [item ids] }]
+// A build as the mod needs it: id, hero, name, author, last edit, favourites, and its categories
+// c: [{ n: name, o: optional, m: [item ids] }]. Category descriptions are left out (the stock
+// viewer shows them): hero files go to the game through the web view's title, so size matters.
 function slimBuild(b) {
     var hb = b.hero_build, det = hb.details || {};
     return {
-        id: hb.hero_build_id, h: hb.hero_id, n: hb.name, v: hb.version, a: hb.author_account_id,
+        id: hb.hero_build_id, h: hb.hero_id, n: hb.name, a: hb.author_account_id,
         u: hb.last_updated_timestamp || hb.publish_timestamp || 0, f: b.num_favorites || 0,
         c: (det.mod_categories || []).map(function (cat) {
             var o = { n: cat.name || "", m: (cat.mods || []).map(function (m) { return m.ability_id; }) };
-            if (cat.description) o.d = cat.description;
             if (cat.optional) o.o = 1;
             return o;
         })
@@ -208,9 +217,11 @@ function itemKey(b) {
 }
 
 // ids (most played first) -> { id: id it is a copy of }. Same build = same item set, or named
-// "Copy of [X]" where X is another build's name. The original is kept (not a "Copy of" name),
-// else the most played.
-function copyMap(ids, builds) {
+// "Copy of [X]" where X is another build's name. Kept from each group, the oldest (lowest id) of:
+// builds by a tracked player (people: the answer's tracked players) not named "Copy of", then any
+// by a tracked player, then any not named "Copy of", then any. So a pro's build is never folded
+// into someone else's copy of it.
+function copyMap(ids, builds, people) {
     var groups = [], byKey = {}, byName = {};
     ids.forEach(function (id) {
         var b = builds[id]; if (!b) return;
@@ -231,7 +242,10 @@ function copyMap(ids, builds) {
     var map = {};
     groups.forEach(function (g) {
         if (!g.ids.length) return;
-        var keep = g.ids.filter(function (id) { return baseName(builds[id].n) === null; })[0] || g.ids[0];
+        var pick = function (list) { return list.length ? Math.min.apply(null, list.map(Number)) : null; };
+        var original = g.ids.filter(function (id) { return baseName(builds[id].n) === null; });
+        var byTracked = function (list) { return list.filter(function (id) { return people && people[builds[id].a]; }); };
+        var keep = pick(byTracked(original)) || pick(byTracked(g.ids)) || pick(original) || pick(g.ids);
         g.ids.forEach(function (id) { map[id] = keep; });
     });
     return map;
@@ -295,16 +309,25 @@ function candidates(answer, extra) {
 function fold(answer, builds) {
     var ids = usage(answer).map(function (x) { return x.id; }).filter(function (id) { return builds[id]; });
     Object.keys(builds).forEach(function (k) { if (ids.indexOf(Number(k)) < 0) ids.push(Number(k)); });
-    var map = copyMap(ids, builds), copies = {};
+    var map = copyMap(ids, builds, answer.people), copies = {};
     Object.keys(map).forEach(function (id) { if (map[id] !== Number(id)) copies[map[id]] = (copies[map[id]] || 0) + 1; });
     if (answer.uses) {
         var merged = {};                                  // a player who ran a build and its copy: one row
         answer.uses.forEach(function (u) {
             var b = map[u[1]]; if (!b) return;
-            var k = u[0] + ":" + b, m = merged[k], built = u[5] !== undefined ? u[5] : -1;
-            if (!m) { merged[k] = [u[0], b, u[2], u[3], u[4] !== undefined ? u[4] : u[2] * 100, built]; return; }
-            // built %: games-weighted over the rows that know it
-            if (built >= 0) m[5] = m[5] >= 0 ? Math.round((m[5] * m[2] + built * u[2]) / (m[2] + u[2])) : built;
+            var k = u[0] + ":" + b, m = merged[k], built = u[5] !== undefined ? u[5] : -1,
+                off = u[6] !== undefined ? u[6] : -1, common = u[7] || [];
+            if (!m) { merged[k] = [u[0], b, u[2], u[3], u[4] !== undefined ? u[4] : u[2] * 100, built, off, common, u[8] || [], u[9] || [], u[10] || []]; return; }
+            // skipped items and swaps: from whichever copy they played more (a copy can differ in items)
+            if (u[2] > m[2]) { m[8] = u[8] || []; m[9] = u[9] || []; m[10] = u[10] || []; }
+            // built %, off-build per game and the off-build items: games-weighted over the rows that know them
+            function mix(i, v) { if (v >= 0) m[i] = m[i] >= 0 ? Math.round((m[i] * m[2] + v * u[2]) / (m[2] + u[2])) : v; }
+            mix(5, built); mix(6, off);
+            var pct = {};
+            m[7].forEach(function (x) { pct[x[0]] = x[1] * m[2]; });
+            common.forEach(function (x) { pct[x[0]] = (pct[x[0]] || 0) + x[1] * u[2]; });
+            m[7] = Object.keys(pct).map(function (i) { return [Number(i), Math.round(pct[i] / (m[2] + u[2]))]; })
+                .sort(function (x, y) { return y[1] - x[1]; }).slice(0, 3);
             m[2] += u[2]; m[3] = Math.max(m[3], u[3]); m[4] += u[4] !== undefined ? u[4] : u[2] * 100;
         });
         answer.uses = Object.keys(merged).map(function (k) { return merged[k]; });
@@ -314,8 +337,9 @@ function fold(answer, builds) {
         answer.nsUses.forEach(function (u) {
             var b = map[u[1]]; if (!b) return;
             var k = u[0] + ":" + b, m = nm[k];
-            if (!m) nm[k] = [u[0], b, u[2], u[3]];
-            else { m[2] += u[2]; m[3] = Math.max(m[3], u[3]); }
+            var w = u[4] !== undefined ? u[4] : u[2] * 100;
+            if (!m) nm[k] = [u[0], b, u[2], u[3], w];
+            else { m[2] += u[2]; m[3] = Math.max(m[3], u[3]); m[4] += w; }
         });
         answer.nsUses = Object.keys(nm).map(function (k) { return nm[k]; });
     }
@@ -341,6 +365,62 @@ function fold(answer, builds) {
     (answer.uses || []).concat(answer.nsUses || []).forEach(function (u) { keepPeople[u[0]] = true; });
     Object.keys(out).forEach(function (k) { keepPeople[out[k].a] = true; });
     Object.keys(answer.people).forEach(function (a) { if (!keepPeople[a]) delete answer.people[a]; });
+    ["heroGames", "nsHeroGames"].forEach(function (key) {
+        if (answer[key]) Object.keys(answer[key]).forEach(function (a) { if (!keepPeople[a]) delete answer[key][a]; });
+    });
+    if (answer.itemNames) {
+        var used = {};
+        (answer.uses || []).forEach(function (u) {
+            (u[7] || []).concat(u[8] || [], u[10] || []).forEach(function (x) { used[x[0]] = true; });
+            (u[9] || []).forEach(function (x) { used[x[0]] = used[x[1]] = true; });
+        });
+        Object.keys(answer.itemNames).forEach(function (i) { if (!used[i]) delete answer.itemNames[i]; });
+    }
+    return answer;
+}
+
+// Drops what the mod never shows from a per-player answer: rows other than each player's main build
+// (ranked and Night Shift), and builds that are neither someone's main build nor written by a
+// tracked player (popular builds are fetched only so their copies fold together). Then the people,
+// totals and item names nobody refers to any more. Keeps hero files small.
+function trim(answer) {
+    if (!answer.uses) return answer;
+    function mains(rows) {
+        var m = mainBuilds(rows);
+        return (rows || []).filter(function (u) { return m[u[0]] === u[1]; });
+    }
+    if (answer.nsUses) answer.nsUses = mains(answer.nsUses);
+    // ranked rows kept: each player's main, and the row of their Night Shift main (NIGHT SHIFT reads
+    // its off-build items from it). A player's main stays their main among these rows.
+    var rankedMain = mainBuilds(answer.uses), nsMain = mainBuilds(answer.nsUses);
+    answer.uses = answer.uses.filter(function (u) { return rankedMain[u[0]] === u[1] || nsMain[u[0]] === u[1]; });
+    var keep = {};
+    answer.uses.concat(answer.nsUses || []).forEach(function (u) { keep[u[1]] = true; });
+    var builds = {};
+    Object.keys(answer.builds).forEach(function (k) {
+        var b = answer.builds[k];
+        var p = answer.people[b.a];
+        // a tracked author's build is listed even before anyone runs it, unless the author is flagged
+        // (bulk publisher, blocked): then only as someone's main
+        if (keep[k] || (p && !p.x && (b.w || p.p || p.m || p.ns || p.t)))
+            builds[k] = b;
+    });
+    answer.builds = builds;
+    var who = {};
+    answer.uses.concat(answer.nsUses || []).forEach(function (u) { who[u[0]] = true; });
+    Object.keys(builds).forEach(function (k) { who[builds[k].a] = true; });
+    Object.keys(answer.people).forEach(function (a) { if (!who[a]) delete answer.people[a]; });
+    ["heroGames", "nsHeroGames"].forEach(function (key) {
+        if (answer[key]) Object.keys(answer[key]).forEach(function (a) { if (!who[a]) delete answer[key][a]; });
+    });
+    if (answer.itemNames) {
+        var used = {};
+        answer.uses.forEach(function (u) {
+            (u[7] || []).concat(u[8] || [], u[10] || []).forEach(function (x) { used[x[0]] = true; });
+            (u[9] || []).forEach(function (x) { used[x[0]] = used[x[1]] = true; });
+        });
+        Object.keys(answer.itemNames).forEach(function (i) { if (!used[i]) delete answer.itemNames[i]; });
+    }
     return answer;
 }
 
@@ -455,7 +535,7 @@ var BI_CORE = {
     config: C, getJson: getJson, pool: pool, chunks: chunks, unique: unique, slimBuild: slimBuild, fetchBuild: fetchBuild,
     profiles: profiles, ranks: ranks, heroes: heroes, items: items, latestPatch: latestPatch,
     overallBoards: overallBoards, heroBoards: heroBoards, roster: roster,
-    copyMap: copyMap, usage: usage, mainBuilds: mainBuilds, candidates: candidates, fold: fold, fetchBuilds: fetchBuilds,
+    copyMap: copyMap, usage: usage, mainBuilds: mainBuilds, candidates: candidates, fold: fold, trim: trim, fetchBuilds: fetchBuilds,
     finishAnswer: finishAnswer, authoredBuilds: authoredBuilds, addProfiles: addProfiles,
     heroGroups: heroGroups, hero: hero
 };
