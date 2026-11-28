@@ -28,7 +28,7 @@ const STORE_DROP_S = 30 * 86400;    // cached answers not used for this long are
 const MISSING_RETRY_S = 3 * 86400;  // a build the API didn't return is asked again after this
 const AUTHORS_REFETCH_S = 20 * 3600;
 const MAX_FETCHES = 8000;           // build and author requests per run; the rest wait for the next run
-const LAKE_TIMEOUT_MS = 40 * 60 * 1000;
+const LAKE_TIMEOUT_MS = 60 * 60 * 1000;  // a full rescan reads ~600 files in batches
 // After a big patch, a player's numbers on a hero count only games since the patch once they have
 // this many there; until then their whole window counts (so a fresh patch doesn't empty the list).
 const PATCH_MIN_GAMES = 5;

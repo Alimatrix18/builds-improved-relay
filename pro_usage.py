@@ -86,6 +86,25 @@ def connect():
     return con
 
 
+def patient_http(con):
+    """Longer HTTP timeouts and more retries for the data lake's files (httpfs must be loaded). The
+    timeout's unit differs between DuckDB versions, so the current value is multiplied."""
+    for name, factor in (("http_timeout", 4), ("http_retries", 3)):
+        try:
+            cur = con.execute(f"SELECT current_setting('{name}')").fetchone()[0]
+            con.execute(f"SET {name} = {int(cur) * factor}")
+        except duckdb.Error:
+            pass
+    try:
+        con.execute("SET http_retry_wait_ms = 2000")
+    except duckdb.Error:
+        pass
+
+
+SCAN_BATCH = 25       # match_player files read per query (one query over 600 remote files can time out)
+SCAN_TRIES = 3        # tries per batch before its files are left for the next run
+SCAN_MAX_FAILED = 0.2 # more than this share of files unread: the scan fails
+SCAN_FAIL_STREAK = 6  # ...as does this many unreadable files in a row (the host is down)
 FULL_SCAN_DAYS = 7     # a full rescan this often picks up the history of players new to the leaderboards
 NEW_PLAYERS_FULL_SCAN = 50   # ...or as soon as more players than this are new to the tracked list
 NS_HALF_LIFE_DAYS = 28   # Night Shift is weekly: its games fade over a month, not a week
@@ -138,10 +157,12 @@ def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None, p
         print(f"{'full scan' if full else 'incremental'}: reading {len(todo)} of {len(listing)} match_player files", flush=True)
         if todo and todo[0][1].startswith("http"):
             con.execute("INSTALL httpfs; LOAD httpfs;")
+            patient_http(con)
         urls = [u for _, u in todo]
         source = f"{len(todo)} new files" if not full else f"{len(todo)} files (full scan)"
     else:
         con.execute("INSTALL httpfs; LOAD httpfs; INSTALL ducklake; LOAD ducklake;")
+        patient_http(con)
         con.execute(f"ATTACH 'ducklake:{CATALOG_URL}' AS lake (READ_ONLY)")
         urls, source = None, "the DuckLake catalog (full scan)"
 
@@ -149,11 +170,9 @@ def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None, p
     con.executemany("INSERT INTO watch VALUES (?)", [(i,) for i in watch])
     con.execute("CREATE TABLE n (match_id UBIGINT, account_id UBIGINT, hero_id UBIGINT, build_id UBIGINT, started BIGINT, items UBIGINT[])")
     t0 = time.time()
-    if urls is None or urls:
-        if urls is None:
-            con.execute("CREATE VIEW mp AS SELECT * FROM lake.match_player")
-        else:
-            con.execute(f"CREATE VIEW mp AS SELECT * FROM read_parquet({urls!r}, union_by_name = true)")
+
+    def scan(source_sql):
+        con.execute(f"CREATE OR REPLACE VIEW mp AS {source_sql}")
         # Column types differ by export (Enum as text or number, DateTime as timestamp or seconds).
         types = {r[0]: r[1].upper() for r in con.execute("DESCRIBE mp").fetchall()}
         st = "epoch(start_time)" if ("TIMESTAMP" in types.get("start_time", "") or "DATE" in types.get("start_time", "")) \
@@ -161,8 +180,7 @@ def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None, p
         mm = types.get("match_mode", "")
         ranked = "CAST(match_mode AS VARCHAR) = 'Ranked'" if ("VARCHAR" in mm or "ENUM" in mm) else "CAST(match_mode AS INTEGER) = 4"
         items = 'CAST("items.item_id" AS UBIGINT[])' if "items.item_id" in types else "CAST([] AS UBIGINT[])"
-        print("scanning ranked games of tracked players…", flush=True)
-        # One row per (match, player): the export can hold a match twice, one copy without its build.
+        # One row per (match, player) per batch (duplicates across batches are removed below).
         # Games with no build loaded are kept as build 0: they count towards USAGE's total only.
         con.execute(f"""
             INSERT INTO n
@@ -171,6 +189,48 @@ def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None, p
             WHERE {st} >= {since} AND {ranked} AND account_id IN (SELECT id FROM watch)
             GROUP BY match_id, account_id
         """)
+
+    failed_keys = set()
+    if urls is None:
+        print("scanning ranked games of tracked players…", flush=True)
+        scan("SELECT * FROM lake.match_player")
+    elif urls:
+        # a few files per query, each batch tried a few times: one slow file no longer sinks the scan,
+        # and a batch that keeps failing is left for the next run (its files aren't marked as read)
+        batches = [todo[i:i + SCAN_BATCH] for i in range(0, len(todo), SCAN_BATCH)]
+        pause = (lambda n: None) if os.environ.get("BI_MANIFEST") else (lambda n: time.sleep(10 * n))
+
+        def read(files, label, tries):
+            for attempt in range(1, tries + 1):
+                try:
+                    scan(f"SELECT * FROM read_parquet({[u for _, u in files]!r}, union_by_name = true)")
+                    return True
+                except duckdb.Error as e:
+                    print(f"{label} try {attempt} failed: {str(e).splitlines()[0][:160]}", flush=True)
+                    if attempt < tries:
+                        pause(attempt)
+            return False
+
+        streak = 0
+        for bi, batch in enumerate(batches):
+            if not read(batch, f"batch {bi + 1}/{len(batches)}", SCAN_TRIES):
+                # one bad or slow file shouldn't cost the whole batch: read its files one by one
+                for key, url in batch:
+                    if read([(key, url)], key, 2):
+                        streak = 0
+                        continue
+                    failed_keys.add(key)
+                    streak += 1
+                    if streak >= SCAN_FAIL_STREAK:      # the host is down, not one bad file: stop now
+                        raise SystemExit(f"{streak} match_player files in a row could not be read")
+            else:
+                streak = 0
+            if (bi + 1) % 4 == 0 or bi + 1 == len(batches):
+                print(f"  {min((bi + 1) * SCAN_BATCH, len(todo))}/{len(todo)} files, {round(time.time() - t0)}s", flush=True)
+        if len(failed_keys) > SCAN_MAX_FAILED * len(todo):
+            raise SystemExit(f"{len(failed_keys)} of {len(todo)} match_player files could not be read")
+        if failed_keys:
+            print(f"{len(failed_keys)} files left for the next run", flush=True)
     print(f"scan done in {round(time.time() - t0)}s: {con.execute('SELECT count(*) FROM n').fetchone()[0]} new (match, player) rows", flush=True)
 
     # saved rows + new rows, one per (match, player), inside the window
@@ -181,7 +241,7 @@ def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None, p
         QUALIFY row_number() OVER (PARTITION BY match_id, account_id ORDER BY build_id DESC, len(items) DESC) = 1
     """)
     con.execute(f"COPY m TO '{store_path}' (FORMAT parquet)")
-    keys = [k for k, _ in listing] if listing is not None else []
+    keys = [k for k, _ in listing if k not in failed_keys] if listing is not None else []
     json.dump({"schema": SCHEMA, "generation": gen, "keys": keys, "watch": watch,
                "full_at": now if full else state.get("full_at", now)}, open(state_path, "w"))
 
