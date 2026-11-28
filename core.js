@@ -8,13 +8,15 @@
 //
 // Hero answer (v3):
 //   { v: 3, hero, generatedAt, patchAt, days, halfLife, source,
-//     people: { accountId: { n: name, av: avatar, r: region, p: leaderboard place (0 = not top 1000),
-//                            m: this hero's leaderboard place (0 = none) } },
+//     people: { accountId: { n: name, av: avatar, b: rank badge (tier*10+subrank), r: region,
+//                            p: leaderboard place (0 = not top 1000), m: this hero's leaderboard place (0 = none),
+//                            ns: 1 for Night Shift regulars } },
 //     uses:   [[accountId, buildId, games, lastPlayed, weightedGames x100, built % (-1 unknown)], ...]
 //             source "players": one row per player and build; weighted: recent games count more
 //     groups: [[buildId, region, group, players, games], ...]    source "groups" (no per-player data):
 //                                                                group 1 = top 100, 2 = top 1000, 3 = hero top 50
-//     builds: { buildId: build } }   builds run by tracked players, plus builds they wrote recently (w: 1)
+//     builds: { buildId: build } }   builds run by tracked players, plus builds they wrote recently (w: 1);
+//             build.f = favourites
 // The daily Action builds "players" answers from deadlock-api's data lake (pro_usage.py); the relay's
 // live fallback (no data file at all) builds "groups" answers from the REST analytics endpoint.
 (function (root) {
@@ -32,7 +34,7 @@ var C = {
     HALF_LIFE_DAYS: 7,      // ...a game this old counts half
     LIVE_DAYS: 14,          // the live fallback's window
     AUTHORED_DAYS: 90,      // builds written by tracked players, edited this recently
-    MAX_AUTHORED: 60,       // per hero, best-placed authors first
+    MAX_AUTHORED: 100,      // per hero, best-placed authors first
     MAX_BUILDS: 120,        // builds kept per hero (most played first)...
     MAX_BUILDS_REGION: 15,  // ...plus each region's most played, so region filters are never empty
     MAX_CANDIDATES: 4,      // a leaderboard name matching more Steam accounts than this is skipped
@@ -83,7 +85,7 @@ function slimBuild(b) {
     var hb = b.hero_build, det = hb.details || {};
     return {
         id: hb.hero_build_id, h: hb.hero_id, n: hb.name, v: hb.version, a: hb.author_account_id,
-        u: hb.last_updated_timestamp || hb.publish_timestamp || 0,
+        u: hb.last_updated_timestamp || hb.publish_timestamp || 0, f: b.num_favorites || 0,
         c: (det.mod_categories || []).map(function (cat) {
             var o = { n: cat.name || "", m: (cat.mods || []).map(function (m) { return m.ability_id; }) };
             if (cat.description) o.d = cat.description;
@@ -108,6 +110,17 @@ function profiles(ids) {
         res.forEach(function (list) {
             (list || []).forEach(function (p) { out[p.account_id] = { n: p.personaname || null, av: p.avatarmedium || null }; });
         });
+        return out;
+    });
+}
+
+// Rank badge (tier * 10 + subrank, 0 = unknown) per account, in batch calls.
+function ranks(ids) {
+    var out = {};
+    return pool(chunks(unique(ids), 200), 3, function (part) {
+        return getJson("/v1/players/rank?account_ids=" + part.join(","));
+    }).then(function (res) {
+        res.forEach(function (list) { (list || []).forEach(function (r) { out[r.account_id] = r.badge || 0; }); });
         return out;
     });
 }
@@ -323,19 +336,26 @@ function authoredBuilds(accountId) {
 function addProfiles(answer, known) {
     var ids = Object.keys(answer.people).concat(Object.keys(answer.builds).map(function (k) { return String(answer.builds[k].a); }));
     ids = unique(ids).filter(function (id) { return !(known && known[id]); });
-    return profiles(ids).then(function (prof) {
-        Object.keys(prof).forEach(function (id) { if (known) known[id] = prof[id]; });
+    return Promise.all([profiles(ids), ranks(ids).catch(function () { return {}; })]).then(function (res) {
+        var prof = res[0], badge = res[1];
+        ids.forEach(function (id) {
+            var p = prof[id] || {};
+            p.b = badge[id] || 0;
+            prof[id] = p;
+            if (known) known[id] = p;
+        });
         function profileOf(id) { return (known && known[id]) || prof[id] || {}; }
         Object.keys(answer.people).forEach(function (id) {
             var p = profileOf(id), x = answer.people[id];
             if (p.n) x.n = p.n;
             x.av = p.av || null;
+            x.b = p.b || 0;
         });
         Object.keys(answer.builds).forEach(function (k) {
             var a = answer.builds[k].a;
             if (answer.people[a]) return;
             var p = profileOf(a);
-            answer.people[a] = { n: p.n || null, av: p.av || null, r: null, p: 0, m: 0 };
+            answer.people[a] = { n: p.n || null, av: p.av || null, b: p.b || 0, r: null, p: 0, m: 0 };
         });
         return answer;
     });
@@ -397,7 +417,7 @@ function hero(heroId, opts) {
 
 var BI_CORE = {
     config: C, getJson: getJson, pool: pool, chunks: chunks, unique: unique, slimBuild: slimBuild, fetchBuild: fetchBuild,
-    profiles: profiles, heroes: heroes, items: items, latestPatch: latestPatch,
+    profiles: profiles, ranks: ranks, heroes: heroes, items: items, latestPatch: latestPatch,
     overallBoards: overallBoards, heroBoards: heroBoards, roster: roster,
     copyMap: copyMap, usage: usage, candidates: candidates, fold: fold, fetchBuilds: fetchBuilds,
     finishAnswer: finishAnswer, authoredBuilds: authoredBuilds, addProfiles: addProfiles,
