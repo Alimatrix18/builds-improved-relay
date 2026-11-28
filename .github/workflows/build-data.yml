@@ -7,8 +7,16 @@ on:
   schedule:
     - cron: "17 3 * * *"      # daily at 03:17 UTC (07:17 in Mauritius), off the busy :00 mark
   workflow_dispatch:          # "Run workflow" button
-  push:
+  push:                       # only when a file the site is built from changes (not README edits)
     branches: [main]
+    paths:
+      - build_data.js
+      - core.js
+      - pro_usage.py
+      - index.html
+      - nightshift.json
+      - trusted.json
+      - .github/workflows/build-data.yml
 
 permissions:
   contents: read
