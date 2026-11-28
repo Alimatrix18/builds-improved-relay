@@ -72,6 +72,7 @@ def connect():
 
 
 FULL_SCAN_DAYS = 7     # a full rescan this often picks up the history of players new to the leaderboards
+NEW_PLAYERS_FULL_SCAN = 50   # ...or as soon as more players than this are new to the tracked list
 
 
 def usage(tracked_path, out_path, matches_path, days, half_life):
@@ -97,8 +98,13 @@ def usage(tracked_path, out_path, matches_path, days, half_life):
         listing, gen = None, None
         print(f"manifest unavailable ({e}); reading through the DuckLake catalog instead", flush=True)
 
+    # many players new to the tracked list (e.g. a new group such as Night Shift): their history is
+    # only in files already read, so read everything again
+    new_players = len(set(tracked) - set(state.get("watch", [])))
     full = (listing is None or not os.path.exists(store_path) or state.get("generation") != gen
-            or now - state.get("full_at", 0) > FULL_SCAN_DAYS * 86400)
+            or now - state.get("full_at", 0) > FULL_SCAN_DAYS * 86400 or new_players > NEW_PLAYERS_FULL_SCAN)
+    if new_players:
+        print(f"{new_players} players new to the tracked list", flush=True)
     watch = sorted(set(tracked) if full else set(tracked) | set(state.get("watch", [])))
     if listing is not None:
         if not listing:
