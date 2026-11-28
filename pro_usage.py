@@ -27,13 +27,17 @@ import urllib.request
 import duckdb
 
 MANIFEST_URL = "https://data.deadlock-api.com/v1/manifest.json"
+CATALOG_URL = "https://data.deadlock-api.com/v1/catalog.ducklake"
+# Python's default User-Agent ("Python-urllib/3.x") is refused by the host's firewall (HTTP 403)
+USER_AGENT = "builds-improved-relay/1.0 (Deadlock mod data; +https://github.com/alimatrix18/builds-improved-relay)"
 
 
 def manifest():
     src = os.environ.get("BI_MANIFEST", MANIFEST_URL)        # a local file for tests
     if not src.startswith("http"):
         return json.load(open(src))
-    with urllib.request.urlopen(src, timeout=60) as r:
+    req = urllib.request.Request(src, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=60) as r:
         return json.load(r)
 
 
@@ -68,16 +72,31 @@ def usage(tracked_path, out_path, matches_path, days, half_life):
     now = int(time.time())
     since = now - days * 86400
 
-    urls = match_player_urls(manifest(), since)
-    if not urls:
-        raise SystemExit("no match_player files for the window")
-
     con = connect()
-    if urls[0].startswith("http"):
-        con.execute("INSTALL httpfs; LOAD httpfs;")
+    try:
+        # the file list, so only files that can hold the window's matches are read
+        urls = match_player_urls(manifest(), since)
+        if not urls:
+            raise SystemExit("no match_player files for the window")
+        if urls[0].startswith("http"):
+            con.execute("INSTALL httpfs; LOAD httpfs;")
+            con.execute(f"SET http_user_agent = '{USER_AGENT}'")
+        con.execute(f"CREATE VIEW mp AS SELECT * FROM read_parquet({urls!r}, union_by_name = true)")
+        source = f"{len(urls)} files"
+    except Exception as e:                                  # the file list was refused: the DuckLake catalog
+        if os.environ.get("BI_MANIFEST"):
+            raise
+        print(f"manifest unavailable ({e}); reading through the DuckLake catalog instead", flush=True)
+        con.execute("INSTALL httpfs; LOAD httpfs; INSTALL ducklake; LOAD ducklake;")
+        try:
+            con.execute(f"SET http_user_agent = '{USER_AGENT}'")
+        except duckdb.Error:
+            pass
+        con.execute(f"ATTACH 'ducklake:{CATALOG_URL}' AS lake (READ_ONLY)")
+        con.execute("CREATE VIEW mp AS SELECT * FROM lake.match_player")
+        source = "the DuckLake catalog"
     con.execute("CREATE TABLE tracked(id UBIGINT)")
     con.executemany("INSERT INTO tracked VALUES (?)", [(i,) for i in tracked])
-    con.execute(f"CREATE VIEW mp AS SELECT * FROM read_parquet({urls!r}, union_by_name = true)")
 
     # Column types differ by export (Enum as text or number, DateTime as timestamp or seconds).
     types = {r[0]: r[1].upper() for r in con.execute("DESCRIBE mp").fetchall()}
@@ -108,7 +127,7 @@ def usage(tracked_path, out_path, matches_path, days, half_life):
     json.dump({"generatedAt": now, "days": days, "halfLife": half_life,
                "rows": [[int(h), int(a), int(b), int(g), int(t), int(w)] for h, a, b, g, t, w in rows]},
               open(out_path, "w"))
-    print(f"{len(rows)} (hero, player, build) rows from {len(urls)} files, {len(tracked)} players tracked")
+    print(f"{len(rows)} (hero, player, build) rows from {source}, {len(tracked)} players tracked")
 
 
 def built(matches_path, build_items_path, shop_path, out_path):
