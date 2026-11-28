@@ -24,6 +24,50 @@ const AUTHORS_REFETCH_S = 20 * 3600;
 const MAX_FETCHES = 8000;           // build and author requests per run; the rest wait for the next run
 const LAKE_TIMEOUT_MS = 40 * 60 * 1000;
 
+// Night Shift regulars from dlns-stats.co.uk's public API (https://dlns-stats.co.uk/api/docs): everyone
+// who played in at least NS_MIN_WEEKS of the last NS_WEEKS weekly events, with their region. One
+// request a second, once a day; the last good list is kept in the cache in case the site is down.
+const NS_SITE = "https://dlns-stats.co.uk";
+const NS_WEEKS = 20, NS_MIN_WEEKS = 3;
+const UA = "builds-improved-relay/1.0 (Deadlock mod data; +https://github.com/alimatrix18/builds-improved-relay)";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function nsGet(p) {
+    const r = await fetch(NS_SITE + p, { headers: { "User-Agent": UA, Accept: "application/json" } });
+    if (!r.ok) throw new Error(p + " -> HTTP " + r.status);
+    return r.json();
+}
+async function nightShiftRegulars() {
+    if (process.env.BI_NO_DLNS) return [];                                              // tests
+    const saved = path.join(CACHE, "nightshift_auto.json");
+    try {
+        const index = await nsGet("/db/nightshift/index?event_title=Night%20Shift");
+        const weeks = (index.weeks || []).map((w) => w.week).filter((w) => w > 0).sort((a, b) => a - b).slice(-NS_WEEKS);
+        const seen = {};                                                                // account -> { name, region, weeks: {} }
+        for (const w of weeks) {
+            try {
+                const d = await nsGet("/db/nightshift/" + w + "?event_title=Night%20Shift");
+                (d.matches || []).forEach((m) => (m.players || []).forEach((p) => {
+                    if (!p.account_id) return;
+                    const x = seen[p.account_id] || (seen[p.account_id] = { name: p.persona_name, region: m.event_region || null, weeks: {} });
+                    x.weeks[w] = true;
+                    x.name = p.persona_name || x.name;
+                    if (m.event_region) x.region = m.event_region;
+                }));
+            } catch (e) { console.warn("Night Shift week " + w + " skipped: " + e.message); }
+            await sleep(1000);
+        }
+        const list = Object.keys(seen).map((id) => ({ id: Number(id), name: seen[id].name, region: seen[id].region, weeks: Object.keys(seen[id].weeks).length }))
+            .filter((x) => x.weeks >= NS_MIN_WEEKS);
+        if (list.length) fs.writeFileSync(saved, JSON.stringify(list));
+        console.log(`${list.length} Night Shift regulars (${NS_MIN_WEEKS}+ of the last ${weeks.length} weeks, dlns-stats.co.uk)`);
+        return list;
+    } catch (e) {
+        const old = readJson(saved, []);
+        console.warn(`dlns-stats.co.uk unavailable (${e.message}); using the last list (${old.length} players)`);
+        return old;
+    }
+}
+
 function write(name, value) { fs.writeFileSync(path.join(OUT, "data", name + ".json"), JSON.stringify(value)); }
 function readJson(file, fallback) { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch (e) { return fallback; } }
 const nowS = () => Math.floor(Date.now() / 1000);
@@ -103,6 +147,16 @@ function store() {
     const heroBoardsById = {};
     await core.pool(heroes, 4, async (h) => { heroBoardsById[h.id] = await core.heroBoards(h.id); });
     const players = core.roster(boards, heroBoardsById);
+    // Night Shift players, listed by hand in nightshift.json: { "players": [{ "id": <Steam account id>, "name": "..." }] }
+    // Night Shift players: regulars from dlns-stats.co.uk, plus any listed by hand in nightshift.json
+    // ({ "players": [{ "id": <Steam account id>, "name": "..." }] })
+    const nsById = {};
+    (await nightShiftRegulars()).forEach((x) => { nsById[x.id] = x; });
+    (readJson(process.env.BI_NIGHTSHIFT_FILE || path.join(__dirname, "nightshift.json"), { players: [] }).players || [])
+        .forEach((x) => { const id = Number(x.id); if (id > 0) nsById[id] = Object.assign({ id, region: null }, nsById[id] || {}, { name: x.name || (nsById[id] || {}).name || null }); });
+    const nsList = Object.values(nsById);
+    nsList.forEach((x) => players.push({ key: "NS|" + x.id, name: x.name, r: x.region || null, p: 0, m: {}, ids: [x.id], ns: true }));
+    if (nsList.length) console.log(`${nsList.length} Night Shift players in all`);
     console.log(`${players.length} leaderboard players (top ${C.TOP} per region + top ${C.TOP_HERO} per hero)`);
 
     // 1. who ran what, and who the tracked players are
@@ -115,9 +169,16 @@ function store() {
         // without match data such names are skipped
         const id = x.ids.length === 1 ? x.ids[0] : x.ids.slice().sort((a, b) => (games[b] || 0) - (games[a] || 0))[0];
         if (x.ids.length > 1 && !games[id]) return;
-        if (!people[id] || (x.p && (!people[id].p || x.p < people[id].p))) people[id] = x;
+        if (x.ns) { if (people[id]) people[id].ns = true; else people[id] = x; return; }   // a listed player who is also ranked
+        const ns = people[id] && people[id].ns;
+        if (!people[id] || people[id].key.startsWith("NS|") || (x.p && (!people[id].p || x.p < people[id].p))) people[id] = Object.assign({}, x, ns ? { ns: true } : {});
     });
-    const person = (id, heroId) => { const x = people[id]; return { n: x.name, av: null, r: x.r, p: x.p || 0, m: x.m[heroId] || 0 }; };
+    const tracked = (x, heroId) => x.p || x.m[heroId] || x.ns;
+    const person = (id, heroId) => {
+        const x = people[id], o = { n: x.name, av: null, r: x.r, p: x.p || 0, m: x.m[heroId] || 0 };
+        if (x.ns) o.ns = 1;
+        return o;
+    };
 
     // 2. builds the tracked players wrote, by hero
     const st = store(), written = {};                    // heroId -> [build]
@@ -134,18 +195,18 @@ function store() {
                 const ppl = {}, uses = [];
                 lake.rows.forEach((r) => {
                     const x = people[r[1]];
-                    if (r[0] !== h.id || !x || !(x.p || x.m[h.id])) return;
+                    if (r[0] !== h.id || !x || !tracked(x, h.id)) return;
                     uses.push([r[1], r[2], r[3], r[4], r[5], -1]);
                     ppl[r[1]] = person(r[1], h.id);
                 });
                 answer = { v: 3, hero: h.id, generatedAt, patchAt, days: C.DAYS, halfLife: C.HALF_LIFE_DAYS, source: "players",
-                           people: ppl, uses, builds: {} };
+                           nightShift: nsList.length, people: ppl, uses, builds: {} };
             } else {
                 answer = await core.heroGroups(h.id, { boards, heroBoards: heroBoardsById[h.id], patchAt });
             }
             // written builds: authors placed best (overall, then on this hero) first
-            const rank = (a) => { const x = people[a]; return x.p ? x.p : 2000 + (x.m[h.id] || 999); };
-            const mine = (written[h.id] || []).filter((b) => people[b.a] && (people[b.a].p || people[b.a].m[h.id]))
+            const rank = (a) => { const x = people[a]; return x.p ? x.p : x.ns ? 1500 : 2000 + (x.m[h.id] || 999); };
+            const mine = (written[h.id] || []).filter((b) => people[b.a] && tracked(people[b.a], h.id))
                 .sort((x, y) => rank(x.a) - rank(y.a)).slice(0, C.MAX_AUTHORED);
             const known = {};
             mine.forEach((b) => { known[b.id] = Object.assign({}, b, { w: 1 }); answer.people[b.a] = answer.people[b.a] || person(b.a, h.id); });
@@ -175,7 +236,12 @@ function store() {
     for (const d of drafts) {
         if (d.error) { failed.push(d.h.name + ": " + d.error); continue; }
         try {
-            const answer = await core.addProfiles(core.fold(d.answer, d.builds), known);
+            const answer = core.fold(d.answer, d.builds);
+            // tracked authors of the kept builds carry their places and tags
+            Object.values(answer.builds).forEach((b) => {
+                if (people[b.a] && tracked(people[b.a], d.h.id)) answer.people[b.a] = Object.assign(answer.people[b.a] || {}, person(b.a, d.h.id));
+            });
+            await core.addProfiles(answer, known);
             write("hero_" + d.h.id, answer);
             ok++;
         } catch (e) {
