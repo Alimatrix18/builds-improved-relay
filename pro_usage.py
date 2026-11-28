@@ -3,12 +3,14 @@
 Reads match_player from the public parquet snapshots (https://deadlock-api.com/data-dumps): one scan
 per run instead of one API call per player.
 
-  python3 pro_usage.py usage <tracked.json> <out.json> <matches.parquet> [days] [half_life_days]
+  python3 pro_usage.py usage <tracked.json> <out.json> <matches.parquet> [days] [half_life_days] [ns_matches.json]
       tracked.json: [account_id, ...]
       out.json:     {"generatedAt", "days", "halfLife",
                      "rows": [[hero, account, build, games, last_unix, weighted_games_x100], ...]}
                     weighted: each game counts 0.5 ** (age / half_life), so recent games count more
       matches.parquet: per (match, player) the build and the shop items bought, for the second step
+      ns_matches.json: [{"match_id", "start"}] Night Shift matches; out.json then also has
+                    "ns_rows": [[hero, account, build, games, last_unix], ...] (the builds loaded in them)
 
   python3 pro_usage.py built <matches.parquet> <build_items.json> <shop_items.json> <out.json>
       build_items.json: {build_id: [item ids]}   shop_items.json: [item ids]
@@ -75,7 +77,7 @@ FULL_SCAN_DAYS = 7     # a full rescan this often picks up the history of player
 NEW_PLAYERS_FULL_SCAN = 50   # ...or as soon as more players than this are new to the tracked list
 
 
-def usage(tracked_path, out_path, matches_path, days, half_life):
+def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None):
     """Incremental: the (match, player) rows already read are kept in <cache>/lake/ with the list of
     files they came from; a run reads only the files added since, unless a full rescan is due (weekly,
     a new export generation, or no saved rows)."""
@@ -90,8 +92,10 @@ def usage(tracked_path, out_path, matches_path, days, half_life):
 
     # the file list, so only files that can hold the window's matches are read; only if the file
     # list itself is refused, the DuckLake catalog (a full scan, slower)
+    m = None
     try:
-        listing, gen = match_player_files(manifest(), since)
+        m = manifest()
+        listing, gen = match_player_files(m, since)
     except Exception as e:
         if os.environ.get("BI_MANIFEST"):
             raise
@@ -171,10 +175,75 @@ def usage(tracked_path, out_path, matches_path, days, half_life):
     """).fetchall()
     con.execute(f"COPY (SELECT account_id, build_id, items FROM t) TO '{matches_path}' (FORMAT parquet)")
 
+    ns_rows = []
+    if ns_path:
+        try:
+            ns_rows = night_shift(con, m, json.load(open(ns_path)), lake_dir)
+        except Exception as e:                              # Night Shift builds are extra: never fail the run
+            print(f"Night Shift builds skipped: {e}", flush=True)
+
     json.dump({"generatedAt": now, "days": days, "halfLife": half_life,
-               "rows": [[int(h), int(a), int(b), int(g), int(t), int(w)] for h, a, b, g, t, w in rows]},
+               "rows": [[int(h), int(a), int(b), int(g), int(t), int(w)] for h, a, b, g, t, w in rows],
+               "ns_rows": ns_rows},
               open(out_path, "w"))
     print(f"{len(rows)} (hero, player, build) rows from {source}, {len(tracked)} players tracked")
+
+
+def night_shift(con, m, ns_matches, lake_dir):
+    """The build each player loaded in Night Shift matches: [[hero, account, build, games, last], ...].
+    ns_matches: [{"match_id", "start"}] from dlns-stats.co.uk. Matches already read are kept in
+    <cache>/lake/ns_rows.parquet; only new ones are looked up, in the files whose match id range
+    can hold them."""
+    store, done_path = os.path.join(lake_dir, "ns_rows.parquet"), os.path.join(lake_dir, "ns_done.json")
+    done = set(json.load(open(done_path))) if os.path.exists(done_path) and os.path.exists(store) else set()
+    wanted = {int(x["match_id"]): int(x.get("start") or 0) for x in ns_matches if x.get("match_id")}
+    todo = sorted(set(wanted) - done)
+    con.execute("CREATE TABLE ns (match_id UBIGINT, account_id UBIGINT, hero_id UBIGINT, build_id UBIGINT, started BIGINT)")
+    if todo:
+        if m is not None:
+            t = m["tables"]["match_player"]
+            gen, base = t.get("generation", 0), m["public_url"].rstrip("/")
+            first = min(wanted[i] for i in todo if wanted[i]) if any(wanted[i] for i in todo) else 0
+            urls = []
+            for f in t["files"]:
+                if f.get("generation", 0) != gen:
+                    continue
+                lo, hi = f.get("min_match_id"), f.get("max_match_id")
+                if lo is not None and hi is not None:
+                    if not any(lo <= i <= hi for i in todo):
+                        continue
+                elif f.get("hi") is not None and first and f["hi"] < first:
+                    continue
+                urls.append(base + "/" + f["key"] if base.startswith("http") else os.path.join(base, f["key"]))
+            src = f"read_parquet({urls!r}, union_by_name = true)" if urls else None
+        else:
+            src = "lake.match_player"
+        if src:
+            con.execute(f"CREATE OR REPLACE VIEW nsmp AS SELECT * FROM {src}")
+            types = {r[0]: r[1].upper() for r in con.execute("DESCRIBE nsmp").fetchall()}
+            st = "epoch(start_time)" if ("TIMESTAMP" in types.get("start_time", "") or "DATE" in types.get("start_time", "")) \
+                else "CAST(start_time AS BIGINT)"
+            con.execute("CREATE TABLE nsids(id UBIGINT)")
+            con.executemany("INSERT INTO nsids VALUES (?)", [(i,) for i in todo])
+            con.execute(f"""
+                INSERT INTO ns
+                SELECT match_id, account_id, any_value(hero_id), max(hero_build_id), max({st})
+                FROM nsmp WHERE match_id IN (SELECT id FROM nsids)
+                GROUP BY match_id, account_id HAVING max(hero_build_id) > 0
+            """)
+        found = {r[0] for r in con.execute("SELECT DISTINCT match_id FROM ns").fetchall()}
+        print(f"Night Shift: {len(found)} of {len(todo)} new matches found in the match data", flush=True)
+        # a match not in the data yet is asked again on later runs, for a week
+        week_ago = int(time.time()) - 7 * 86400
+        done |= found | {i for i in todo if wanted[i] and wanted[i] < week_ago}
+    old = f"SELECT * FROM read_parquet('{store}')" if os.path.exists(store) else "SELECT * FROM ns WHERE false"
+    keep = ",".join(str(i) for i in wanted) or "0"
+    con.execute(f"CREATE TABLE nsall AS SELECT * FROM ({old} UNION ALL SELECT * FROM ns) WHERE match_id IN ({keep}) "
+                "QUALIFY row_number() OVER (PARTITION BY match_id, account_id ORDER BY build_id DESC) = 1")
+    con.execute(f"COPY nsall TO '{store}' (FORMAT parquet)")
+    json.dump(sorted(i for i in done if i in wanted), open(done_path, "w"))
+    rows = con.execute("SELECT hero_id, account_id, build_id, count(*), max(started) FROM nsall GROUP BY ALL").fetchall()
+    return [[int(h), int(a), int(b), int(g), int(t)] for h, a, b, g, t in rows]
 
 
 def built(matches_path, build_items_path, shop_path, out_path):
@@ -208,7 +277,8 @@ def main():
     mode = sys.argv[1]
     if mode == "usage":
         usage(sys.argv[2], sys.argv[3], sys.argv[4],
-              int(sys.argv[5]) if len(sys.argv) > 5 else 45, float(sys.argv[6]) if len(sys.argv) > 6 else 7)
+              int(sys.argv[5]) if len(sys.argv) > 5 else 45, float(sys.argv[6]) if len(sys.argv) > 6 else 7,
+              sys.argv[7] if len(sys.argv) > 7 else None)
     elif mode == "built":
         built(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
     else:

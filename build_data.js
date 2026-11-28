@@ -37,15 +37,20 @@ async function nsGet(p) {
     return r.json();
 }
 async function nightShiftRegulars() {
-    if (process.env.BI_NO_DLNS) return [];                                              // tests
+    if (process.env.BI_NO_DLNS) return { players: [], matches: [] };                    // tests
     const saved = path.join(CACHE, "nightshift_auto.json");
     try {
         const index = await nsGet("/db/nightshift/index?event_title=Night%20Shift");
         const weeks = (index.weeks || []).map((w) => w.week).filter((w) => w > 0).sort((a, b) => a - b).slice(-NS_WEEKS);
-        const seen = {};                                                                // account -> { name, region, weeks: {} }
+        const seen = {}, matches = [];                                                  // account -> { name, region, weeks: {} }
         for (const w of weeks) {
             try {
                 const d = await nsGet("/db/nightshift/" + w + "?event_title=Night%20Shift");
+                (d.matches || []).forEach((m) => {
+                    if (!m.match_id) return;
+                    const st = typeof m.start_time === "number" ? m.start_time : Math.floor(Date.parse(m.start_time || "") / 1000) || 0;
+                    matches.push({ match_id: m.match_id, start: st });
+                });
                 (d.matches || []).forEach((m) => (m.players || []).forEach((p) => {
                     if (!p.account_id) return;
                     const x = seen[p.account_id] || (seen[p.account_id] = { name: p.persona_name, region: m.event_region || null, weeks: {} });
@@ -58,12 +63,14 @@ async function nightShiftRegulars() {
         }
         const list = Object.keys(seen).map((id) => ({ id: Number(id), name: seen[id].name, region: seen[id].region, weeks: Object.keys(seen[id].weeks).length }))
             .filter((x) => x.weeks >= NS_MIN_WEEKS);
-        if (list.length) fs.writeFileSync(saved, JSON.stringify(list));
-        console.log(`${list.length} Night Shift regulars (${NS_MIN_WEEKS}+ of the last ${weeks.length} weeks, dlns-stats.co.uk)`);
-        return list;
+        const result = { players: list, matches };
+        if (list.length) fs.writeFileSync(saved, JSON.stringify(result));
+        console.log(`${list.length} Night Shift regulars (${NS_MIN_WEEKS}+ of the last ${weeks.length} weeks, ${matches.length} matches, dlns-stats.co.uk)`);
+        return result;
     } catch (e) {
-        const old = readJson(saved, []);
-        console.warn(`dlns-stats.co.uk unavailable (${e.message}); using the last list (${old.length} players)`);
+        let old = readJson(saved, { players: [], matches: [] });
+        if (Array.isArray(old)) old = { players: old, matches: [] };                 // older cache format
+        console.warn(`dlns-stats.co.uk unavailable (${e.message}); using the last list (${old.players.length} players)`);
         return old;
     }
 }
@@ -77,12 +84,14 @@ function python(args) {
 }
 
 // Who ran what: { rows: [[hero, account, build, games, last, weighted x100], ...] } from the data lake, or null.
-function lakeUsage(accounts) {
+function lakeUsage(accounts, nsMatches) {
     if (process.env.BI_USAGE_FILE) return readJson(process.env.BI_USAGE_FILE, null);   // tests
     const tracked = path.join(CACHE, "tracked.json"), out = path.join(CACHE, "usage.json");
     fs.writeFileSync(tracked, JSON.stringify(accounts));
+    const nsFile = path.join(CACHE, "ns_matches.json");
+    fs.writeFileSync(nsFile, JSON.stringify(nsMatches || []));
     try {
-        python(["usage", tracked, out, path.join(CACHE, "matches.parquet"), String(C.DAYS), String(C.HALF_LIFE_DAYS)]);
+        python(["usage", tracked, out, path.join(CACHE, "matches.parquet"), String(C.DAYS), String(C.HALF_LIFE_DAYS), nsFile]);
         return readJson(out, null);
     } catch (e) {
         console.warn("data lake scan failed, using per-group totals instead: " + e.message);
@@ -150,8 +159,8 @@ function store() {
     // Night Shift players, listed by hand in nightshift.json: { "players": [{ "id": <Steam account id>, "name": "..." }] }
     // Night Shift players: regulars from dlns-stats.co.uk, plus any listed by hand in nightshift.json
     // ({ "players": [{ "id": <Steam account id>, "name": "..." }] })
-    const nsById = {};
-    (await nightShiftRegulars()).forEach((x) => { nsById[x.id] = x; });
+    const nsById = {}, ns = await nightShiftRegulars();
+    ns.players.forEach((x) => { nsById[x.id] = x; });
     (readJson(process.env.BI_NIGHTSHIFT_FILE || path.join(__dirname, "nightshift.json"), { players: [] }).players || [])
         .forEach((x) => { const id = Number(x.id); if (id > 0) nsById[id] = Object.assign({ id, region: null }, nsById[id] || {}, { name: x.name || (nsById[id] || {}).name || null }); });
     const nsList = Object.values(nsById);
@@ -160,7 +169,7 @@ function store() {
     console.log(`${players.length} leaderboard players (top ${C.TOP} per region + top ${C.TOP_HERO} per hero)`);
 
     // 1. who ran what, and who the tracked players are
-    const lake = lakeUsage(core.unique([].concat(...players.map((x) => x.ids))));
+    const lake = lakeUsage(core.unique([].concat(...players.map((x) => x.ids))), ns.matches);
     const people = {};                                   // account -> leaderboard player
     const games = {};
     if (lake) lake.rows.forEach((r) => { games[r[1]] = (games[r[1]] || 0) + r[3]; });
@@ -199,8 +208,16 @@ function store() {
                     uses.push([r[1], r[2], r[3], r[4], r[5], -1]);
                     ppl[r[1]] = person(r[1], h.id);
                 });
+                // the builds Night Shift players loaded in Night Shift matches: [[account, build, games, last], ...]
+                const nsUses = [];
+                (lake.ns_rows || []).forEach((r) => {
+                    const x = people[r[1]];
+                    if (r[0] !== h.id || !x || !x.ns) return;
+                    nsUses.push([r[1], r[2], r[3], r[4]]);
+                    ppl[r[1]] = person(r[1], h.id);
+                });
                 answer = { v: 3, hero: h.id, generatedAt, patchAt, days: C.DAYS, halfLife: C.HALF_LIFE_DAYS, source: "players",
-                           nightShift: nsList.length, people: ppl, uses, builds: {} };
+                           nightShift: nsList.length, people: ppl, uses, nsUses, builds: {} };
             } else {
                 answer = await core.heroGroups(h.id, { boards, heroBoards: heroBoardsById[h.id], patchAt });
             }

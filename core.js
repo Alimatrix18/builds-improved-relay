@@ -12,7 +12,9 @@
 //                            p: leaderboard place (0 = not top 1000), m: this hero's leaderboard place (0 = none),
 //                            ns: 1 for Night Shift regulars } },
 //     uses:   [[accountId, buildId, games, lastPlayed, weightedGames x100, built % (-1 unknown)], ...]
-//             source "players": one row per player and build; weighted: recent games count more
+//             source "players": one row per player and build in ranked games; weighted: recent games count more
+//     nsUses: [[accountId, buildId, games, lastPlayed], ...]   the builds Night Shift players loaded in
+//             Night Shift matches (match ids from dlns-stats.co.uk)
 //     groups: [[buildId, region, group, players, games], ...]    source "groups" (no per-player data):
 //                                                                group 1 = top 100, 2 = top 1000, 3 = hero top 50
 //     builds: { buildId: build } }   builds run by tracked players, plus builds they wrote recently (w: 1);
@@ -37,6 +39,7 @@ var C = {
     MAX_AUTHORED: 100,      // per hero, best-placed authors first
     MAX_BUILDS: 120,        // builds kept per hero (most played first)...
     MAX_BUILDS_REGION: 15,  // ...plus each region's most played, so region filters are never empty
+    MAX_MAINS: 250,         // per hero: the builds tracked players use most (their "main" build), most shared first
     MAX_CANDIDATES: 4,      // a leaderboard name matching more Steam accounts than this is skipped
     ID_CHUNK: 300,          // account ids per analytics request
     SAME_ITEMS_MIN: 6       // builds sharing an item set this big are the same build
@@ -251,9 +254,32 @@ function usage(answer) {
         .sort(function (x, y) { return (y.players - x.players) || (y.weight - x.weight); });
 }
 
-// The builds worth fetching for an answer: the most played (and each region's), plus extra ids
-// (builds tracked players wrote).
+// Each player's most played build in rows [[account, build, games, ...]]: { account: build }.
+function mainBuilds(rows) {
+    var best = {};
+    (rows || []).forEach(function (u) {
+        var b = best[u[0]];
+        if (!b || u[2] > b[2] || (u[2] === b[2] && u[3] > b[3])) best[u[0]] = u;
+    });
+    var out = {};
+    Object.keys(best).forEach(function (a) { out[a] = best[a][1]; });
+    return out;
+}
+
+// The builds worth fetching for an answer. With per-player data: every tracked player's main build
+// (ranked and Night Shift), most shared first, plus extra ids (builds tracked players wrote). With
+// per-group data: the most played (and each region's).
 function candidates(answer, extra) {
+    if (answer.uses) {
+        var count = {};
+        [mainBuilds(answer.uses), mainBuilds(answer.nsUses)].forEach(function (m) {
+            Object.keys(m).forEach(function (a) { count[m[a]] = (count[m[a]] || 0) + 1; });
+        });
+        var mains = Object.keys(count).map(Number).sort(function (x, y) { return count[y] - count[x]; }).slice(0, C.MAX_MAINS);
+        // plus the most played overall, so copies of popular builds are fetched and folded into them
+        var popular = usage(answer).slice(0, C.MAX_BUILDS).map(function (x) { return x.id; });
+        return unique(mains.concat(popular, extra || []));
+    }
     var ranked = usage(answer), keep = ranked.slice(0, C.MAX_BUILDS).map(function (x) { return x.id; });
     C.LB_REGIONS.forEach(function (lr) {
         var r = C.LB_SHORT[lr];
@@ -283,6 +309,16 @@ function fold(answer, builds) {
         });
         answer.uses = Object.keys(merged).map(function (k) { return merged[k]; });
     }
+    if (answer.nsUses) {
+        var nm = {};
+        answer.nsUses.forEach(function (u) {
+            var b = map[u[1]]; if (!b) return;
+            var k = u[0] + ":" + b, m = nm[k];
+            if (!m) nm[k] = [u[0], b, u[2], u[3]];
+            else { m[2] += u[2]; m[3] = Math.max(m[3], u[3]); }
+        });
+        answer.nsUses = Object.keys(nm).map(function (k) { return nm[k]; });
+    }
     if (answer.groups) {
         var g = {};                                       // copies add their players and games (an estimate)
         answer.groups.forEach(function (x) {
@@ -302,7 +338,7 @@ function fold(answer, builds) {
     answer.builds = out;
     // people: the players with rows, and the builds' authors when they are tracked
     var keepPeople = {};
-    (answer.uses || []).forEach(function (u) { keepPeople[u[0]] = true; });
+    (answer.uses || []).concat(answer.nsUses || []).forEach(function (u) { keepPeople[u[0]] = true; });
     Object.keys(out).forEach(function (k) { keepPeople[out[k].a] = true; });
     Object.keys(answer.people).forEach(function (a) { if (!keepPeople[a]) delete answer.people[a]; });
     return answer;
@@ -419,7 +455,7 @@ var BI_CORE = {
     config: C, getJson: getJson, pool: pool, chunks: chunks, unique: unique, slimBuild: slimBuild, fetchBuild: fetchBuild,
     profiles: profiles, ranks: ranks, heroes: heroes, items: items, latestPatch: latestPatch,
     overallBoards: overallBoards, heroBoards: heroBoards, roster: roster,
-    copyMap: copyMap, usage: usage, candidates: candidates, fold: fold, fetchBuilds: fetchBuilds,
+    copyMap: copyMap, usage: usage, mainBuilds: mainBuilds, candidates: candidates, fold: fold, fetchBuilds: fetchBuilds,
     finishAnswer: finishAnswer, authoredBuilds: authoredBuilds, addProfiles: addProfiles,
     heroGroups: heroGroups, hero: hero
 };
