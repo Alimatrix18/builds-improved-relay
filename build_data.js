@@ -35,6 +35,10 @@ const PATCH_MIN_GAMES = 5;
 // An author whose builds for this many heroes were all updated within BULK_SPAN_S is a bulk
 // publisher (a site or tool generating builds): their builds rank with untrusted ones.
 const BULK_HEROES = 20, BULK_SPAN_S = 3 * 86400;
+// An author's build counts as a top player's build on a hero only if they play that hero: 20+ ranked
+// games on it in the window (about what unlocking a hero for ranked takes: 15 wins and 5 losses),
+// or 3+ Night Shift games on it, or a place in its top 50. Players on trusted.json are exempt.
+const AUTHOR_MIN_GAMES = 20, AUTHOR_MIN_NS_GAMES = 3;
 
 // Night Shift regulars from dlns-stats.co.uk's public API (https://dlns-stats.co.uk/api/docs): everyone
 // who played in at least NS_MIN_WEEKS of the last NS_WEEKS weekly events, with their region. One
@@ -237,13 +241,19 @@ function store() {
     });
     const tracked = (x, heroId) => x.p || x.m[heroId] || x.ns || x.t;
     const flags = {};                                    // account -> why their builds aren't trusted
+    const playedOn = {};                                 // heroId -> { account: [ranked games, Night Shift games] }
     const person = (id, heroId) => {
         const x = people[id], o = { n: x.name, av: null, r: x.r, p: x.p || 0, m: x.m[heroId] || 0 };
         if (x.ns) o.ns = 1;
         if (x.t) o.t = 1;
         if (flags[id]) o.x = flags[id];
+        // q: plays this hero enough for their builds of it to count (hg / nsg: their games on it)
+        const g = (playedOn[heroId] && playedOn[heroId][id]) || [0, 0];
+        o.hg = g[0]; o.nsg = g[1];
+        o.q = !lakeKnown || o.m || x.t || g[0] >= AUTHOR_MIN_GAMES || g[1] >= AUTHOR_MIN_NS_GAMES ? 1 : 0;
         return o;
     };
+    let lakeKnown = false;
 
     // 2. builds the tracked players wrote, by hero
     const st = store(), written = {};                    // heroId -> [build]
@@ -271,6 +281,10 @@ function store() {
         lakeBy[k] = {};
         ((lake && lake[k]) || []).forEach((r) => { (lakeBy[k][r[0]] = lakeBy[k][r[0]] || []).push(r); });
     });
+    // every tracked player's games per hero in the window (build loaded or not), for authors' "q"
+    lakeKnown = !!(lake && lake.totals && lake.totals.length);
+    (lake && lake.totals || []).forEach((r) => { ((playedOn[r[0]] = playedOn[r[0]] || {})[r[1]] = playedOn[r[0]][r[1]] || [0, 0])[0] = r[2]; });
+    (lake && lake.ns_totals || []).forEach((r) => { ((playedOn[r[0]] = playedOn[r[0]] || {})[r[1]] = playedOn[r[0]][r[1]] || [0, 0])[1] = r[2]; });
     // a few heroes at a time (their builds are fetched in parallel too); drafts keep the heroes' order
     const drafts = await core.pool(heroes, 3, async (h) => {
         try {
@@ -310,7 +324,8 @@ function store() {
             // written builds: authors placed best (overall, then on this hero) first
             const rank = (a) => { const x = people[a]; return x.p ? x.p : x.ns ? 1500 : 2000 + (x.m[h.id] || 999); };
             // (not bulk publishers' or blocked accounts': those are never shown unless someone runs them)
-            const mine = (written[h.id] || []).filter((b) => people[b.a] && tracked(people[b.a], h.id) && !flags[b.a])
+            // (only authors who play this hero: a build of a hero they rarely play is listed only if someone runs it)
+            const mine = (written[h.id] || []).filter((b) => people[b.a] && tracked(people[b.a], h.id) && !flags[b.a] && person(b.a, h.id).q)
                 .sort((x, y) => rank(x.a) - rank(y.a)).slice(0, C.MAX_AUTHORED);
             const known = {};
             mine.forEach((b) => { known[b.id] = Object.assign({}, b, { w: 1 }); answer.people[b.a] = answer.people[b.a] || person(b.a, h.id); });

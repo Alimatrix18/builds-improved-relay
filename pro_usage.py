@@ -171,10 +171,16 @@ def usage(tracked_path, out_path, matches_path, days, half_life, ns_path=None, p
     con.execute("CREATE TABLE n (match_id UBIGINT, account_id UBIGINT, hero_id UBIGINT, build_id UBIGINT, started BIGINT, items UBIGINT[])")
     t0 = time.time()
 
+    schema_logged = []
     def scan(source_sql):
         con.execute(f"CREATE OR REPLACE VIEW mp AS {source_sql}")
         # Column types differ by export (Enum as text or number, DateTime as timestamp or seconds).
         types = {r[0]: r[1].upper() for r in con.execute("DESCRIBE mp").fetchall()}
+        if not schema_logged:
+            # which item and ability columns the export has (ability order needs per-item times/upgrades)
+            cols = sorted(c for c in types if c.startswith("items.") or "abilit" in c.lower())
+            print("match_player item/ability columns: " + ", ".join(f"{c} {types[c]}" for c in cols), flush=True)
+            schema_logged.append(True)
         st = "epoch(start_time)" if ("TIMESTAMP" in types.get("start_time", "") or "DATE" in types.get("start_time", "")) \
             else "CAST(start_time AS BIGINT)"
         mm = types.get("match_mode", "")
