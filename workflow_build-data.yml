@@ -21,7 +21,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -30,8 +30,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install DuckDB (reads deadlock-api's data lake)
+        run: pip install duckdb
+      # builds are fetched one by one, so keep them between runs
+      - uses: actions/cache@v4
+        with:
+          path: cache
+          key: bi-cache-${{ github.run_id }}
+          restore-keys: bi-cache-
       - name: Build data files
-        run: node build_data.js _site
+        run: node build_data.js _site cache
       - name: Add the relay page
         run: cp index.html core.js _site/
       - uses: actions/upload-pages-artifact@v3

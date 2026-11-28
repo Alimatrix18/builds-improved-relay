@@ -58,27 +58,30 @@ var commands = {
     hero: function (q) {
         var id = Number(q.hero);
         if (!id) return Promise.reject(new Error("no hero"));
-        var hit = load("bi_cache_hero_" + id);
+        var hit = load("bi_cache_hero2_" + id);
         if (q.stale && hit) { hit.data.cachedAt = hit.at; return Promise.resolve(hit.data); }
-        return cached("hero_" + id, q.fresh ? 0 : CACHE_S, function () {
-            return prebuilt("hero_" + id, PREBUILT_MAX_AGE_S).then(function (d) { return d || core.hero(id); });
+        return cached("hero2_" + id, q.fresh ? 0 : CACHE_S, function () {
+            return prebuilt("hero_" + id, PREBUILT_MAX_AGE_S).then(function (d) { return d && d.v === 2 ? d : core.hero(id); });
         }).then(function (d) {
-            var c = load("bi_cache_hero_" + id);
+            var c = load("bi_cache_hero2_" + id);
             d.cachedAt = c ? c.at : nowS();
             return d;
         });
     },
-    following: function (q) {
-        var ids = (q.ids || []).map(Number).filter(Boolean).slice(0, 40), hero = Number(q.hero);
-        return cached("follow_" + hero + "_" + ids.slice().sort().join(","), CACHE_S, function () { return core.following(ids, hero); });
+    // builds starred in PROS (whole builds, so they show even when no pro plays them any more),
+    // kept in this page's storage so they survive restarts; newest first, at most 200
+    saved_get: function () { return Promise.resolve(load("bi_saved") || []); },
+    saved_add: function (q) {
+        var b = q.build;
+        if (!b || !b.id) return Promise.reject(new Error("no build"));
+        var list = (load("bi_saved") || []).filter(function (x) { return x.id !== b.id; });
+        list.unshift(b);
+        store("bi_saved", list.slice(0, 200));
+        return Promise.resolve(true);
     },
-    search: function (q) { return core.search(q.text); },
-    // the follow list lives in this page's localStorage, so it survives game restarts
-    follows_get: function () { return Promise.resolve(load("bi_follows") || []); },
-    follows_set: function (q) {
-        var ids = (q.ids || []).map(Number).filter(Boolean).slice(0, 40);
-        store("bi_follows", ids);
-        return Promise.resolve(ids);
+    saved_remove: function (q) {
+        store("bi_saved", (load("bi_saved") || []).filter(function (x) { return x.id !== Number(q.id); }));
+        return Promise.resolve(true);
     }
 };
 
