@@ -1,21 +1,22 @@
 // Builds Improved: shared data logic.
 // Runs in the relay page (browser) and in build_data.js (Node, GitHub Action).
 //
-// What PROS shows for a hero: the builds top players actually played in ranked games. Each row of
-// the answer says who played which build, how many games and when last, so the mod can filter by
-// region (ALL / NA / EU / ...) and by player group (top 1000, top 100, the hero's mains) and sort
-// (best, last played, most played, newest) without asking again.
+// What PROS shows for a hero: builds top players stand behind. Trust, not performance: who wrote a
+// build, which top players ran it, how recently and how much, and whether they actually followed it.
+// The mod filters by region (ALL / NA / EU / ...) and player group (top 1000, top 100, the hero's top
+// 50, saved) and sorts (best, last played, most played, newest) without asking again.
 //
-// Hero answer (v2):
-//   { v: 2, hero, generatedAt, patchAt, days, source,
+// Hero answer (v3):
+//   { v: 3, hero, generatedAt, patchAt, days, halfLife, source,
 //     people: { accountId: { n: name, av: avatar, r: region, p: leaderboard place (0 = not top 1000),
 //                            m: this hero's leaderboard place (0 = none) } },
-//     uses:   [[accountId, buildId, games, lastPlayed], ...]     source "players": one row per player and build
-//     groups: [[buildId, region, group, players, games], ...]    source "groups" (live fallback, no per-player data):
-//                                                                group 1 = top 100, 2 = top 1000, 3 = hero mains
-//     builds: { buildId: build } }
-// The hourly Action builds "players" answers from deadlock-api's data lake (pro_usage.py); when it
-// can't, and in the relay's live fallback, "groups" answers come from the REST analytics endpoint.
+//     uses:   [[accountId, buildId, games, lastPlayed, weightedGames x100, built % (-1 unknown)], ...]
+//             source "players": one row per player and build; weighted: recent games count more
+//     groups: [[buildId, region, group, players, games], ...]    source "groups" (no per-player data):
+//                                                                group 1 = top 100, 2 = top 1000, 3 = hero top 50
+//     builds: { buildId: build } }   builds run by tracked players, plus builds they wrote recently (w: 1)
+// The daily Action builds "players" answers from deadlock-api's data lake (pro_usage.py); the relay's
+// live fallback (no data file at all) builds "groups" answers from the REST analytics endpoint.
 (function (root) {
 "use strict";
 
@@ -27,7 +28,11 @@ var C = {
     TOP: 1000,              // leaderboard places tracked per region
     TOP_SMALL: 100,         // the "TOP 100" group
     TOP_HERO: 50,           // hero leaderboard places that count as the hero's mains ("MAIN")
-    DAYS: 14,               // ranked games this recent
+    DAYS: 45,               // ranked games this recent...
+    HALF_LIFE_DAYS: 7,      // ...a game this old counts half
+    LIVE_DAYS: 14,          // the live fallback's window
+    AUTHORED_DAYS: 90,      // builds written by tracked players, edited this recently
+    MAX_AUTHORED: 60,       // per hero, best-placed authors first
     MAX_BUILDS: 120,        // builds kept per hero (most played first)...
     MAX_BUILDS_REGION: 15,  // ...plus each region's most played, so region filters are never empty
     MAX_CANDIDATES: 4,      // a leaderboard name matching more Steam accounts than this is skipped
@@ -216,27 +221,26 @@ function copyMap(ids, builds) {
     return map;
 }
 
-// Per build: distinct players and games, for picking which builds to keep.
+// Per build: distinct players and (recency-weighted) games, for picking which builds to keep.
 function usage(answer) {
     var by = {};
-    function at(b) { return by[b] || (by[b] = { id: b, players: 0, games: 0, regions: {} }); }
+    function at(b) { return by[b] || (by[b] = { id: b, players: 0, weight: 0, regions: {} }); }
     (answer.uses || []).forEach(function (u) {
         var x = at(u[1]), r = (answer.people[u[0]] || {}).r;
-        x.players++; x.games += u[2];
+        x.players++; x.weight += u[4] !== undefined ? u[4] : u[2] * 100;
         if (r) x.regions[r] = (x.regions[r] || 0) + 1;
     });
     (answer.groups || []).forEach(function (g) {
         if (g[2] !== 2) return;                          // count each player once: the top-1000 rows
-        var x = at(g[0]); x.players += g[3]; x.games += g[4]; x.regions[g[1]] = (x.regions[g[1]] || 0) + g[3];
+        var x = at(g[0]); x.players += g[3]; x.weight += g[4] * 100; x.regions[g[1]] = (x.regions[g[1]] || 0) + g[3];
     });
     return Object.keys(by).map(function (k) { return by[k]; })
-        .sort(function (x, y) { return (y.players - x.players) || (y.games - x.games); });
+        .sort(function (x, y) { return (y.players - x.players) || (y.weight - x.weight); });
 }
 
-// Keeps the most played builds (and each region's), fetches them, folds copies into their original
-// and drops rows for builds that are gone or are for another hero.
-// getBuild(id) -> Promise<build | null>
-function finishAnswer(answer, getBuild) {
+// The builds worth fetching for an answer: the most played (and each region's), plus extra ids
+// (builds tracked players wrote).
+function candidates(answer, extra) {
     var ranked = usage(answer), keep = ranked.slice(0, C.MAX_BUILDS).map(function (x) { return x.id; });
     C.LB_REGIONS.forEach(function (lr) {
         var r = C.LB_SHORT[lr];
@@ -244,45 +248,74 @@ function finishAnswer(answer, getBuild) {
               .sort(function (x, y) { return y.regions[r] - x.regions[r]; })
               .slice(0, C.MAX_BUILDS_REGION).forEach(function (x) { keep.push(x.id); });
     });
-    keep = unique(keep);
-    var builds = {};
-    return pool(keep, 6, function (id) { return getBuild(id); }).then(function (list) {
-        list.forEach(function (b) { if (b && b.h === answer.hero) builds[b.id] = b; });
-        var map = copyMap(keep.filter(function (id) { return builds[id]; }), builds);
-        var copies = {};
-        Object.keys(map).forEach(function (id) { if (map[id] !== Number(id)) copies[map[id]] = (copies[map[id]] || 0) + 1; });
-        if (answer.uses) {
-            var merged = {};                             // a player who played a build and its copy: one row
-            answer.uses.forEach(function (u) {
-                var b = map[u[1]]; if (!b) return;
-                var k = u[0] + ":" + b, m = merged[k];
-                if (!m) merged[k] = [u[0], b, u[2], u[3]];
-                else { m[2] += u[2]; m[3] = Math.max(m[3], u[3]); }
-            });
-            answer.uses = Object.keys(merged).map(function (k) { return merged[k]; });
-            var used = {};
-            answer.uses.forEach(function (u) { used[u[0]] = true; });
-            Object.keys(answer.people).forEach(function (a) { if (!used[a]) delete answer.people[a]; });
-        }
-        if (answer.groups) {
-            var g = {};                                   // copies add their players and games (an estimate)
-            answer.groups.forEach(function (x) {
-                var b = map[x[0]]; if (!b) return;
-                var k = [b, x[1], x[2]].join(":"), m = g[k];
-                if (!m) g[k] = [b, x[1], x[2], x[3], x[4]];
-                else { m[3] += x[3]; m[4] += x[4]; }
-            });
-            answer.groups = Object.keys(g).map(function (k) { return g[k]; });
-        }
-        var out = {};
-        Object.keys(builds).forEach(function (id) {
-            if (map[id] !== Number(id)) return;
-            if (copies[id]) builds[id].k = copies[id];
-            out[id] = builds[id];
+    return unique(keep.concat(extra || []));
+}
+
+// Folds copies into their original and drops rows for builds that are missing or for another
+// hero. builds: { id: build } of this hero (written ones carry w: 1).
+function fold(answer, builds) {
+    var ids = usage(answer).map(function (x) { return x.id; }).filter(function (id) { return builds[id]; });
+    Object.keys(builds).forEach(function (k) { if (ids.indexOf(Number(k)) < 0) ids.push(Number(k)); });
+    var map = copyMap(ids, builds), copies = {};
+    Object.keys(map).forEach(function (id) { if (map[id] !== Number(id)) copies[map[id]] = (copies[map[id]] || 0) + 1; });
+    if (answer.uses) {
+        var merged = {};                                  // a player who ran a build and its copy: one row
+        answer.uses.forEach(function (u) {
+            var b = map[u[1]]; if (!b) return;
+            var k = u[0] + ":" + b, m = merged[k], built = u[5] !== undefined ? u[5] : -1;
+            if (!m) { merged[k] = [u[0], b, u[2], u[3], u[4] !== undefined ? u[4] : u[2] * 100, built]; return; }
+            // built %: games-weighted over the rows that know it
+            if (built >= 0) m[5] = m[5] >= 0 ? Math.round((m[5] * m[2] + built * u[2]) / (m[2] + u[2])) : built;
+            m[2] += u[2]; m[3] = Math.max(m[3], u[3]); m[4] += u[4] !== undefined ? u[4] : u[2] * 100;
         });
-        answer.builds = out;
-        return answer;
+        answer.uses = Object.keys(merged).map(function (k) { return merged[k]; });
+    }
+    if (answer.groups) {
+        var g = {};                                       // copies add their players and games (an estimate)
+        answer.groups.forEach(function (x) {
+            var b = map[x[0]]; if (!b) return;
+            var k = [b, x[1], x[2]].join(":"), m = g[k];
+            if (!m) g[k] = [b, x[1], x[2], x[3], x[4]];
+            else { m[3] += x[3]; m[4] += x[4]; }
+        });
+        answer.groups = Object.keys(g).map(function (k) { return g[k]; });
+    }
+    var out = {};
+    Object.keys(builds).forEach(function (id) {
+        if (map[id] !== Number(id)) return;
+        if (copies[id]) builds[id].k = copies[id];
+        out[id] = builds[id];
     });
+    answer.builds = out;
+    // people: the players with rows, and the builds' authors when they are tracked
+    var keepPeople = {};
+    (answer.uses || []).forEach(function (u) { keepPeople[u[0]] = true; });
+    Object.keys(out).forEach(function (k) { keepPeople[out[k].a] = true; });
+    Object.keys(answer.people).forEach(function (a) { if (!keepPeople[a]) delete answer.people[a]; });
+    return answer;
+}
+
+// Fetches the candidate builds of this hero. getBuild(id) -> Promise<build | null>
+function fetchBuilds(ids, heroId, getBuild, known) {
+    var builds = {};
+    Object.keys(known || {}).forEach(function (k) { if (known[k].h === heroId) builds[k] = known[k]; });
+    var need = ids.filter(function (id) { return !builds[id]; });
+    return pool(need, 6, function (id) { return getBuild(id); }).then(function (list) {
+        list.forEach(function (b) { if (b && b.h === heroId) builds[b.id] = b; });
+        return builds;
+    });
+}
+
+// The relay's path: fetch, then fold.
+function finishAnswer(answer, getBuild) {
+    return fetchBuilds(candidates(answer), answer.hero, getBuild).then(function (builds) { return fold(answer, builds); });
+}
+
+// Builds a tracked player wrote (all heroes), edited in the last AUTHORED_DAYS days.
+function authoredBuilds(accountId) {
+    var since = now() - C.AUTHORED_DAYS * 86400;
+    return getJson("/v1/builds?author_id=" + accountId + "&only_latest=true&min_unix_timestamp=" + since + "&limit=100")
+        .then(function (list) { return (list || []).map(slimBuild); });
 }
 
 // Names and avatars for the players and the builds' authors (people without a leaderboard entry
@@ -312,10 +345,11 @@ function addProfiles(answer, known) {
 
 // "groups" answer from the analytics endpoint: per region and player group, how many tracked
 // players picked each build and their games. Only leaderboard names with one Steam account count.
+// min_matches=1: the endpoint's default (20 games per build per request) would hide most builds.
 function heroGroups(heroId, opts) {
     opts = opts || {};
     heroId = Number(heroId);
-    var t = now(), since = t - C.DAYS * 86400;
+    var t = now(), since = t - C.LIVE_DAYS * 86400;
     return Promise.all([
         opts.boards ? Promise.resolve(opts.boards) : overallBoards(),
         opts.heroBoards ? Promise.resolve(opts.heroBoards) : heroBoards(heroId),
@@ -336,7 +370,7 @@ function heroGroups(heroId, opts) {
             });
         });
         return pool(asks, 4, function (a) {
-            return getJson("/v1/analytics/hero-build-stats?hero_ids=" + heroId + "&match_mode=ranked&min_unix_timestamp=" + since +
+            return getJson("/v1/analytics/hero-build-stats?hero_ids=" + heroId + "&match_mode=ranked&min_matches=1&min_unix_timestamp=" + since +
                            "&account_ids=" + a[2].join(","));
         }).then(function (lists) {
             var sum = {};
@@ -348,7 +382,7 @@ function heroGroups(heroId, opts) {
                     else { s[3] += x.players; s[4] += x.matches; }
                 });
             });
-            return { v: 2, hero: heroId, generatedAt: t, patchAt: res[2] || 0, days: C.DAYS, source: "groups",
+            return { v: 3, hero: heroId, generatedAt: t, patchAt: res[2] || 0, days: C.LIVE_DAYS, source: "groups",
                      people: {}, groups: Object.keys(sum).map(function (k) { return sum[k]; }), builds: {} };
         });
     });
@@ -365,7 +399,8 @@ var BI_CORE = {
     config: C, getJson: getJson, pool: pool, chunks: chunks, unique: unique, slimBuild: slimBuild, fetchBuild: fetchBuild,
     profiles: profiles, heroes: heroes, items: items, latestPatch: latestPatch,
     overallBoards: overallBoards, heroBoards: heroBoards, roster: roster,
-    copyMap: copyMap, usage: usage, finishAnswer: finishAnswer, addProfiles: addProfiles,
+    copyMap: copyMap, usage: usage, candidates: candidates, fold: fold, fetchBuilds: fetchBuilds,
+    finishAnswer: finishAnswer, authoredBuilds: authoredBuilds, addProfiles: addProfiles,
     heroGroups: heroGroups, hero: hero
 };
 root.BI_CORE = BI_CORE;

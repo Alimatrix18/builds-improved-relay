@@ -10,14 +10,15 @@
 // Builds Improved relay page.
 // The mod opens this page in the game's hidden web view with ?q=<command JSON>.
 // The page answers by changing document.title in chunks: "BI|<req>|<index>|<count>|<chunk>".
-// Hero data comes from the hourly prebuilt files in data/ (see build_data.js); if those are
-// missing or stale it is built live from deadlock-api.com with the same code (core.js).
+// Hero data comes from the daily prebuilt files in data/ (see build_data.js); only if a file is
+// missing is a per-group answer built live from deadlock-api.com (core.js).
 "use strict";
 
 var CHUNK = 4000;            // the web view passes at most 4096 characters per title, prefix included
 var GAP_MS = 10;             // pause between title changes
 var CACHE_S = 600;           // live answers are reused for 10 minutes (the page reloads per request)
-var PREBUILT_MAX_AGE_S = 3 * 3600;
+// Data files are rebuilt daily; any age is used (the mod shows how old it is). Only when there is
+// no file at all does the page build a (much thinner) answer live.
 var core = window.BI_CORE;
 
 function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} }
@@ -58,12 +59,12 @@ var commands = {
     hero: function (q) {
         var id = Number(q.hero);
         if (!id) return Promise.reject(new Error("no hero"));
-        var hit = load("bi_cache_hero2_" + id);
+        var hit = load("bi_cache_hero3_" + id);
         if (q.stale && hit) { hit.data.cachedAt = hit.at; return Promise.resolve(hit.data); }
-        return cached("hero2_" + id, q.fresh ? 0 : CACHE_S, function () {
-            return prebuilt("hero_" + id, PREBUILT_MAX_AGE_S).then(function (d) { return d && d.v === 2 ? d : core.hero(id); });
+        return cached("hero3_" + id, q.fresh ? 0 : CACHE_S, function () {
+            return prebuilt("hero_" + id, 0).then(function (d) { return d && d.v === 3 ? d : core.hero(id); });
         }).then(function (d) {
-            var c = load("bi_cache_hero2_" + id);
+            var c = load("bi_cache_hero3_" + id);
             d.cachedAt = c ? c.at : nowS();
             return d;
         });
